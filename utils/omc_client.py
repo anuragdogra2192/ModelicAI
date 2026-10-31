@@ -14,6 +14,15 @@ class OpenModelicaClient:
       print(f"[OMCClient] Error initializing OMC session: {e}")
       raise e
 
+    # Generated models import Modelica.*, which OMC only resolves once the
+    # Standard Library is loaded into the session.
+    if not self.omc.sendExpression("loadModel(Modelica)"):
+      print("[OMCClient] Modelica Standard Library not found. Installing package via OpenModelica...")
+      self.omc.sendExpression('installPackage(Modelica)')
+      if not self.omc.sendExpression("loadModel(Modelica)"):
+        raise RuntimeError("OpenModelica could not load or install the Modelica Standard Library")
+    print("[OMCClient] Modelica Standard Library loaded successfully.")
+
   def compile_model(self, file_path: str, model_name: str) -> dict:
     """Loads a Modelica file into the OMC session and runs checkModel()
 

@@ -20,14 +20,18 @@ class DesignAgent:
     """
 
     system_prompt = (
-        "You are an expert Modelica simulation engineer and software architect. "
-        "Your task is to write clean, valid, standalone Modelica (.mo) code "
-        "based on the user's physical system description. "
-        "Use components from the Modelica Standard Library (MSL) when applicable. "
-        "Ensure all differential-algebraic equations (DAEs) are balanced and variables are properly typed. "
-        "Return ONLY the valid Modelica code block enclosed in triple backticks "
-        "using the `modelica` identifier. Do not include markdown prose outside the code block."
-    )
+            "You are an expert Modelica code generation agent.\n"
+            "You write valid, syntactically correct Modelica code (.mo) without markdown syntax errors.\n"
+            "CRITICAL MODELICA RULES:\n"
+            "1. Always include standard library imports if needed (e.g., `import Modelica.Electrical.Analog;`).\n"
+            "2. For an RC Circuit, use these exact component paths:\n"
+            "   - DC Voltage Source: `Modelica.Electrical.Analog.Sources.ConstantVoltage` (with parameter `V`)\n"
+            "   - Resistor: `Modelica.Electrical.Analog.Basic.Resistor` (with parameter `R`)\n"
+            "   - Capacitor: `Modelica.Electrical.Analog.Basic.Capacitor` (with parameter `C`)\n"
+            "   - Ground: `Modelica.Electrical.Analog.Basic.Ground`\n"
+            "3. Connect components properly in the `equation` section using `connect(pin1, pin2);`.\n"
+            "4. Return ONLY raw Modelica code or code inside a clean ```modelica block. No conversational text."
+        )
 
     user_content = f"User Request: {prompt}"
 

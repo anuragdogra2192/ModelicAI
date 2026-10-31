@@ -39,6 +39,12 @@ RUN useradd --create-home --uid 1000 modelica && \
     chown -R modelica:modelica /app
 USER modelica
 
+# Step 6b: The apt package does not bundle the Modelica Standard Library.
+# Install it into the modelica user's library path, where OMC looks for it at runtime.
+RUN printf '%s\n' 'installPackage(Modelica, "4.1.0+maint.om", exactMatch=true);' > /tmp/install_msl.mos && \
+    omc /tmp/install_msl.mos && \
+    rm /tmp/install_msl.mos
+
 # Step 7: Expose port for FastAPI / MCP Server
 EXPOSE 8000
 

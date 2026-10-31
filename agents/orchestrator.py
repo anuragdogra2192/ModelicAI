@@ -177,18 +177,18 @@ class SimulationOrchestrator:
         print(f"   ✓ Simulation finished. Output file: {self.state['result_file']}")
 
     def _run_visualization_agent(self, human_input: str):
-        print("\n📊 [Orchestrator] Step -> Dispatching task to Visualization Agent...")
-        if not self.state["result_file"]:
-            print("   ⚠️ No result file available yet. Running full sequence.")
-            self._run_design_validation_loop(human_input)
-            self._run_introspect()
-            self._run_solver_agent(human_input)
+      print("\n📊 [Orchestrator] Step -> Dispatching task to Visualization Agent...")
+      if not self.state["result_file"]:
+        print("   ⚠️ No result file available yet. Running full sequence.")
+        self._run_design_validation_loop(human_input)
+        self._run_introspect()
+        self._run_solver_agent(human_input)
 
-        self.client.omc.sendExpression(f'readSimulationResult("{self.state["result_file"]}")')
-        dashboard_path = self.vis_agent.render_dashboard(
-            omc_session=self.client.omc,
-            result_file=self.state["result_file"],
-            user_intent=human_input
-        )
-        self.state["dashboard_path"] = dashboard_path
-        print(f"   ✓ Visualization Agent created dashboard at: {dashboard_path}")
+      # Directly call visualization agent with result file path
+      dashboard_path = self.vis_agent.render_dashboard(
+          omc_session=self.client.omc,
+          result_file=self.state["result_file"],
+          user_intent=human_input,
+      )
+      self.state["dashboard_path"] = dashboard_path
+      print(f"   ✓ Visualization Agent created dashboard at: {dashboard_path}")
