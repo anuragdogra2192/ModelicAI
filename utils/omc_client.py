@@ -1,4 +1,5 @@
 import os
+import re
 from OMPython import OMCSessionLocal
 
 
@@ -23,35 +24,53 @@ class OpenModelicaClient:
         raise RuntimeError("OpenModelica could not load or install the Modelica Standard Library")
     print("[OMCClient] Modelica Standard Library loaded successfully.")
 
+  def _error_buffer(self) -> str:
+    """OMC keeps diagnostics in an error buffer; most API calls only return false/""."""
+    try:
+      return str(self.omc.sendExpression("getErrorString()") or "").strip()
+    except Exception:
+      return ""
+
   def compile_model(self, file_path: str, model_name: str) -> dict:
     """Loads a Modelica file into the OMC session and runs checkModel()
 
-    to validate DAE balance and syntax. Returns status and error logs if any.
+    to validate syntax, types and DAE balance. Returns status, the full
+    OpenModelica diagnostics on failure, and the checkModel summary
+    ("Class X has N equation(s) and N variable(s)...") on success.
     """
+    abs_path = os.path.abspath(file_path)
     try:
-      # Absolute path required for containerized file loading
-      abs_path = os.path.abspath(file_path)
-
-      # Load the Modelica model file
+      self._error_buffer()  # clear stale messages from earlier calls
       load_res = self.omc.sendExpression(f'loadFile("{abs_path}")')
       if not load_res:
-        return {
-            "status": "FAILED",
-            "error": f"Failed to load file into OMC: {abs_path}",
-        }
+        return {"status": "FAILED", "message": "",
+                "error": self._error_buffer() or f"Failed to load file into OMC: {abs_path}"}
 
-      # Check model syntax and equations
       check_res = self.omc.sendExpression(f"checkModel({model_name})")
-      check_str = str(check_res)
+      check_str = str(check_res or "").strip()
+      diagnostics = self._error_buffer()
 
-      # OpenModelica typically returns a success string or error details
       if "successfully" in check_str.lower():
-        return {"status": "SUCCESS", "error": ""}
-      else:
-        return {"status": "FAILED", "error": check_str}
+        # checkModel can report success for an unbalanced system ("has 126 equation(s) and 127 variable(s)");
+        # such a model cannot be simulated, so treat it as a failure the designer must fix.
+        counts = re.search(r"has (\d+) equation\(s\) and (\d+) variable\(s\)", check_str)
+        if counts and counts.group(1) != counts.group(2):
+          n_eq, n_var = int(counts.group(1)), int(counts.group(2))
+          kind = "Too few equations (under-determined)" if n_eq < n_var else "Too many equations (over-determined)"
+          return {"status": "FAILED", "message": check_str,
+                  "error": (f"{kind}: the model has {n_eq} equation(s) and {n_var} variable(s). "
+                            "Typical causes: an unconnected connector or input (e.g. a RealInput or fluid port "
+                            "left open), a missing start value or boundary condition, or a variable declared "
+                            "without an equation.\n" + "\n".join(x for x in (check_str, diagnostics) if x))}
+        # Warnings may still be present; keep them for the UI.
+        return {"status": "SUCCESS", "error": "", "message": check_str, "warnings": diagnostics}
+      return {"status": "FAILED", "message": check_str,
+              "error": "\n".join(x for x in (check_str, diagnostics) if x)
+                       or f"checkModel({model_name}) failed without a message"}
 
     except Exception as e:
-      return {"status": "FAILED", "error": str(e)}
+      # Newer OMPython raises on OMC errors; the exception text carries the diagnostics.
+      return {"status": "FAILED", "message": "", "error": str(e)}
 
   def get_model_parameters(self, model_name: str) -> dict:
     """Returns the current value of every parameter of a loaded model."""

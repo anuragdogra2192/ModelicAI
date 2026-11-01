@@ -80,7 +80,7 @@ class VisualizationAgent:
       }
 
   def render_dashboard(
-      self, omc_session, result_file: str, user_intent: str
+      self, omc_session, result_file: str, user_intent: str, output_dir: str = "."
   ) -> str:
     """Agent tool: Directly parses .mat result file with SciPy,
 
@@ -152,7 +152,7 @@ class VisualizationAgent:
         height=350 * len(subplots),
     )
 
-    output_html = "interactive_dashboard.html"
+    output_html = os.path.join(output_dir, "interactive_dashboard.html")
     fig.write_html(output_html)
     print(
         f"\n✨ [VisualizationAgent] Interactive dashboard generated:"

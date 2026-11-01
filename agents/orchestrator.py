@@ -9,27 +9,33 @@ from utils.omc_client import OpenModelicaClient
 from agents.designer import DesignAgent
 from agents.simulation import SimulationAgent
 from agents.visualization import VisualizationAgent
+from agents.graph_parser import ModelicaGraphParser
+
+# Each model gets its own folder: models/<ModelName>/
+MODEL_ROOT = "models"
 
 class SimulationOrchestrator:
     def __init__(self):
         self.llm = ChatAnthropic(model=os.getenv("MODEL_NAME", "claude-haiku-5-5"))
         self.client = OpenModelicaClient()
         
-        # Initialize sub-agents
+        # Initialize sub-agents & parsers
         self.designer = DesignAgent()
         self.sim_agent = SimulationAgent()
         self.vis_agent = VisualizationAgent()
+        self.graph_parser = ModelicaGraphParser()
 
         # Shared session state
         self.state = {
             "model_name": "RCCircuit",
-            "file_path": "temp_model.mo",
+            "file_path": os.path.join(MODEL_ROOT, "RCCircuit", "RCCircuit.mo"),
             "code": "",
             "error_log": None,
             "status": "PENDING",
             "model_parameters": {},
             "solver_options": {},
             "simulation_config": {},
+            "graph_schema": {},
             "result_file": None,
             "dashboard_path": None
         }
@@ -37,23 +43,24 @@ class SimulationOrchestrator:
         # Initialize short-term memory checkpointer
         self.memory = MemorySaver()
 
-    def _decide_action_plan(self, human_input: str) -> List[str]:
-        """Uses LLM to interpret human input and decide which actions to take."""
+    def _decide_action_plan(self, human_input: str) -> Dict[str, Any]:
+        """Uses LLM to interpret human input and decide which actions to take or conversational response."""
         system_prompt = (
             "You are the Master Orchestrator for ModelicAI, a CAE simulation agent system.\n"
-            "Analyze the human input and determine which actions to take from the following set:\n"
-            "- 'design_and_validate': Use Designer Agent to write Modelica code and validate/self-correct via OpenModelica compiler.\n"
-            "- 'introspect': Introspect/inspect model and solver parameters from OpenModelica.\n"
-            "- 'solver': Consult Solver Agent to optimize parameters & execute simulation.\n"
-            "- 'visualization': Consult Visualization Agent to generate interactive Plotly dashboard.\n\n"
-            "Return ONLY a JSON array of string action names in execution order.\n"
-            "Example 1 (New Model): [\"design_and_validate\", \"introspect\", \"solver\", \"visualization\"]\n"
-            "Example 2 (Just Update Plot): [\"visualization\"]"
+            "Analyze the human input and determine the appropriate intent category:\n"
+            "- 'greeting': Casual conversation, hi, hello, how are you.\n"
+            "- 'list_models': Asking how many models exist or to list available models.\n"
+            "- 'recheck_model': Asking to recheck, revalidate, or verify an existing model.\n"
+            "- 'design_and_simulate': Requesting a new model design, simulation, or full solver pipeline.\n\n"
+            "Return ONLY a JSON object with two keys:\n"
+            "1. 'intent': one of ['greeting', 'list_models', 'recheck_model', 'design_and_simulate']\n"
+            "2. 'actions': list of action strings from ['design_and_validate', 'introspect', 'solver', 'visualization'] (empty for greeting/list_models)\n"
+            "3. 'response_message': A friendly conversational response text if it's a greeting or direct answer, otherwise empty string."
         )
         
         user_content = (
             f"Human Input: '{human_input}'\n"
-            f"Current System State: Code Exists = {bool(self.state['code'])}, Result File Available = {self.state['result_file'] is not None}"
+            f"Current Active Model: {self.state['model_name']}"
         )
 
         response = self.llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_content)])
@@ -72,16 +79,48 @@ class SimulationOrchestrator:
         try:
             return json.loads(content_str)
         except json.JSONDecodeError:
-            return ["design_and_validate", "introspect", "solver", "visualization"]
+            return {
+                "intent": "design_and_simulate",
+                "actions": ["design_and_validate", "introspect", "solver", "visualization"],
+                "response_message": ""
+            }
 
-    def process_human_input(self, human_input: str, thread_id: str = "default_session"):
-        config = {"configurable": {"thread_id": thread_id}}
+    def process_human_input(self, human_input: str, thread_id: str = "default_session") -> Dict[str, Any]:
         print(f"\n🗣️ [Human Input - Thread {thread_id}]: '{human_input}'")
         
-        plan = self._decide_action_plan(human_input)
-        print(f"🎯 [Orchestrator Plan]: {plan}")
+        plan_data = self._decide_action_plan(human_input)
+        intent = plan_data.get("intent", "design_and_simulate")
+        print(f"🎯 [Orchestrator Intent]: {intent} | Plan Actions: {plan_data.get('actions')}")
 
-        for action in plan:
+        # 1. Handle Greetings
+        if intent == "greeting":
+            msg = plan_data.get("response_message") or "Hello! I am ModelicAI, your agentic CAE assistant. How can I help you design or simulate your systems today?"
+            return {"status": "SUCCESS", "message": msg, "model_name": self.state["model_name"]}
+
+        # 2. Handle List Models Query
+        elif intent == "list_models":
+            models = []
+            if os.path.exists(MODEL_ROOT):
+                models = [d for d in os.listdir(MODEL_ROOT) if os.path.isdir(os.path.join(MODEL_ROOT, d))]
+            
+            msg = f"We currently have {len(models)} model(s) saved in the platform: {', '.join(models) if models else 'None'}."
+            return {"status": "SUCCESS", "message": msg, "models": models}
+
+        # 3. Handle Recheck / Revalidate Model Query
+        elif intent == "recheck_model":
+            print(f"\n🔍 [Orchestrator] Rechecking active model: {self.state['model_name']}...")
+            if not os.path.exists(self.state["file_path"]):
+                return {"status": "FAILED", "message": f"Model file not found at {self.state['file_path']}"}
+            
+            result = self.client.compile_model(file_path=self.state["file_path"], model_name=self.state["model_name"])
+            if result["status"] == "SUCCESS":
+                return {"status": "SUCCESS", "message": f"Model '{self.state['model_name']}' successfully re-validated and compiled cleanly!"}
+            else:
+                return {"status": "FAILED", "message": f"Re-validation failed: {result['error']}"}
+
+        # 4. Full Execution Pipeline (Design, Introspect, Solve, Visualize)
+        actions = plan_data.get("actions", ["design_and_validate", "introspect", "solver", "visualization"])
+        for action in actions:
             if action == "design_and_validate":
                 self._run_design_validation_loop(human_input)
             elif action == "introspect":
@@ -90,6 +129,13 @@ class SimulationOrchestrator:
                 self._run_solver_agent(human_input)
             elif action == "visualization":
                 self._run_visualization_agent(human_input)
+
+        return {
+            "status": "SUCCESS",
+            "model_name": self.state["model_name"],
+            "message": f"Successfully processed intent for model '{self.state['model_name']}'.",
+            "dashboard_available": self.state["dashboard_path"] is not None
+        }
 
     def _run_design_validation_loop(self, prompt: str, max_retries: int = 3):
         """Self-correcting loop between Designer Agent and OpenModelica validation."""
@@ -104,14 +150,8 @@ class SimulationOrchestrator:
             retry_count += 1
             print(f"\n[Designer Node] Generating Modelica code (Attempt {retry_count}/{max_retries})...")
             
-            # Generate code using designer agent (passing error log if it failed previously)
             code = self.designer.generate_code(prompt=prompt, error_log=error_log)
             
-            # Save temporarily
-            with open(self.state["file_path"], "w") as f:
-                f.write(code)
-
-            # Extract model name heuristic
             model_name = "Model"
             for line in code.split("\n"):
                 if line.strip().startswith("model "):
@@ -121,7 +161,12 @@ class SimulationOrchestrator:
                         break
             self.state["model_name"] = model_name
 
-            # Validate via OpenModelica
+            model_dir = os.path.join(MODEL_ROOT, model_name)
+            os.makedirs(model_dir, exist_ok=True)
+            self.state["file_path"] = os.path.join(model_dir, f"{model_name}.mo")
+            with open(self.state["file_path"], "w") as f:
+                f.write(code)
+
             print("[Validation Node] Compiling code with OpenModelica...")
             result = self.client.compile_model(file_path=self.state["file_path"], model_name=model_name)
             
@@ -130,6 +175,16 @@ class SimulationOrchestrator:
 
             if status == "SUCCESS":
                 print("[Router] Validation SUCCESS! Model compiled cleanly.")
+                try:
+                    graph_data = self.graph_parser.parse_mo_file(self.state["file_path"])
+                    schema_path = os.path.join(model_dir, "graph_schema.json")
+                    with open(schema_path, "w") as sf:
+                        json.dump(graph_data, sf, indent=2)
+                    self.state["graph_schema"] = graph_data
+                    print(f"   ✓ Generated & saved React Flow graph schema to: {schema_path}")
+                except Exception as e:
+                    print(f"   ⚠️ Warning: Failed to generate graph schema: {e}")
+                
                 break
             else:
                 print(f"[Router] Validation FAILED (Attempt {retry_count}). Feeding error back to Designer for correction...")
@@ -143,7 +198,7 @@ class SimulationOrchestrator:
 
     def _run_introspect(self):
         print("\n🔍 [Orchestrator] Step -> Introspecting OpenModelica parameters...")
-        self.client.omc.sendExpression(f'loadFile("{self.state["file_path"]}")')
+        self.client.omc.sendExpression(f'loadFile("{os.path.abspath(self.state["file_path"])}")')
         self.state["model_parameters"] = self.client.get_model_parameters(self.state["model_name"])
         self.state["solver_options"] = self.client.get_simulation_options(self.state["model_name"])
         print(f"   ✓ Introspected parameters for '{self.state['model_name']}'.")
@@ -164,6 +219,8 @@ class SimulationOrchestrator:
         print(f"   ✓ Solver Agent suggested config: {json.dumps(config, indent=2)}")
 
         print("   -> Executing numerical solver...")
+        model_dir = os.path.dirname(os.path.abspath(self.state["file_path"]))
+        self.client.omc.sendExpression(f'cd("{model_dir}")')
         sim_res = self.client.run_simulation(
             model_name=self.state["model_name"],
             start_time=config.get("startTime", 0.0),
@@ -177,18 +234,18 @@ class SimulationOrchestrator:
         print(f"   ✓ Simulation finished. Output file: {self.state['result_file']}")
 
     def _run_visualization_agent(self, human_input: str):
-      print("\n📊 [Orchestrator] Step -> Dispatching task to Visualization Agent...")
-      if not self.state["result_file"]:
-        print("   ⚠️ No result file available yet. Running full sequence.")
-        self._run_design_validation_loop(human_input)
-        self._run_introspect()
-        self._run_solver_agent(human_input)
+        print("\n📊 [Orchestrator] Step -> Dispatching task to Visualization Agent...")
+        if not self.state["result_file"]:
+            print("   ⚠️ No result file available yet. Running full sequence.")
+            self._run_design_validation_loop(human_input)
+            self._run_introspect()
+            self._run_solver_agent(human_input)
 
-      # Directly call visualization agent with result file path
-      dashboard_path = self.vis_agent.render_dashboard(
-          omc_session=self.client.omc,
-          result_file=self.state["result_file"],
-          user_intent=human_input,
-      )
-      self.state["dashboard_path"] = dashboard_path
-      print(f"   ✓ Visualization Agent created dashboard at: {dashboard_path}")
+        dashboard_path = self.vis_agent.render_dashboard(
+            omc_session=self.client.omc,
+            result_file=self.state["result_file"],
+            user_intent=human_input,
+            output_dir=os.path.dirname(os.path.abspath(self.state["file_path"])),
+        )
+        self.state["dashboard_path"] = dashboard_path
+        print(f"   ✓ Visualization Agent created dashboard at: {dashboard_path}")

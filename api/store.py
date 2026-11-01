@@ -1,0 +1,142 @@
+"""Persistent model memory: runs, revisions, notes and pending proposals.
+
+Lives in the same SQLite file as the chat history (api/chat_store.py), so one
+mounted ./data volume keeps everything. The LangGraph checkpointer uses its own
+file next to it (see agents/manager.py).
+"""
+import json
+import sqlite3
+import threading
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+from api.chat_store import DB_PATH, _conn as _chat_conn
+
+_lock = threading.Lock()
+
+
+def _conn() -> sqlite3.Connection:
+  c = _chat_conn()  # creates the file and the messages table
+  c.executescript("""
+    CREATE TABLE IF NOT EXISTS runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL,
+      settings TEXT NOT NULL, overrides TEXT NOT NULL, status TEXT NOT NULL,
+      metrics TEXT NOT NULL DEFAULT '{}', wall REAL, source TEXT, created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS revisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, code TEXT NOT NULL,
+      summary TEXT NOT NULL, source TEXT, created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, text TEXT NOT NULL,
+      created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS proposals (
+      id TEXT PRIMARY KEY, model TEXT, kind TEXT NOT NULL, payload TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS model_meta (
+      model TEXT PRIMARY KEY, origin_prompt TEXT, purpose TEXT, created REAL);
+    CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model, id);
+    CREATE INDEX IF NOT EXISTS idx_rev_model ON revisions(model, id);
+  """)
+  return c
+
+
+def _rows(sql: str, args=()) -> List[sqlite3.Row]:
+  with _lock, _conn() as c:
+    c.row_factory = sqlite3.Row
+    return c.execute(sql, args).fetchall()
+
+
+def _exec(sql: str, args=()) -> int:
+  with _lock, _conn() as c:
+    return c.execute(sql, args).lastrowid
+
+
+# ------------------------------------------------------------------ runs
+def add_run(model, settings, overrides, status, metrics=None, wall=None, source="gui") -> int:
+  return _exec("INSERT INTO runs (model, settings, overrides, status, metrics, wall, source, created) "
+               "VALUES (?,?,?,?,?,?,?,?)",
+               (model, json.dumps(settings), json.dumps(overrides), status,
+                json.dumps(metrics or {}), wall, source, time.time()))
+
+
+def runs(model: str, limit: int = 5) -> List[Dict[str, Any]]:
+  out = []
+  for r in _rows("SELECT * FROM runs WHERE model=? ORDER BY id DESC LIMIT ?", (model, limit)):
+    out.append({"id": r["id"], "settings": json.loads(r["settings"]), "overrides": json.loads(r["overrides"]),
+                "status": r["status"], "metrics": json.loads(r["metrics"]), "wall": r["wall"],
+                "source": r["source"], "created": r["created"]})
+  return out
+
+
+# ------------------------------------------------------------- revisions
+def add_revision(model: str, code: str, summary: str, source: str = "agent") -> int:
+  return _exec("INSERT INTO revisions (model, code, summary, source, created) VALUES (?,?,?,?,?)",
+               (model, code, summary, source, time.time()))
+
+
+def revisions(model: str, limit: int = 8) -> List[Dict[str, Any]]:
+  return [{"id": r["id"], "summary": r["summary"], "source": r["source"], "created": r["created"]}
+          for r in _rows("SELECT id, summary, source, created FROM revisions WHERE model=? "
+                         "ORDER BY id DESC LIMIT ?", (model, limit))]
+
+
+def revision_code(model: str, rev_id: int) -> Optional[str]:
+  r = _rows("SELECT code FROM revisions WHERE model=? AND id=?", (model, rev_id))
+  return r[0]["code"] if r else None
+
+
+# ------------------------------------------------------------------ notes
+def add_note(model: str, text: str) -> int:
+  return _exec("INSERT INTO notes (model, text, created) VALUES (?,?,?)", (model, text, time.time()))
+
+
+def notes(model: str) -> List[str]:
+  return [r["text"] for r in _rows("SELECT text FROM notes WHERE model=? ORDER BY id", (model,))]
+
+
+# ------------------------------------------------------------ model meta
+def set_meta(model: str, origin_prompt: str = None, purpose: str = None) -> None:
+  with _lock, _conn() as c:
+    c.execute("INSERT INTO model_meta (model, origin_prompt, purpose, created) VALUES (?,?,?,?) "
+              "ON CONFLICT(model) DO UPDATE SET origin_prompt=COALESCE(excluded.origin_prompt, origin_prompt), "
+              "purpose=COALESCE(excluded.purpose, purpose)",
+              (model, origin_prompt, purpose, time.time()))
+
+
+def meta(model: str) -> Dict[str, Any]:
+  r = _rows("SELECT * FROM model_meta WHERE model=?", (model,))
+  return dict(r[0]) if r else {}
+
+
+# -------------------------------------------------------------- proposals
+def add_proposal(model: Optional[str], kind: str, payload: Dict[str, Any]) -> str:
+  pid = uuid.uuid4().hex[:10]
+  _exec("INSERT INTO proposals (id, model, kind, payload, created) VALUES (?,?,?,?,?)",
+        (pid, model, kind, json.dumps(payload), time.time()))
+  return pid
+
+
+def proposal(pid: str) -> Optional[Dict[str, Any]]:
+  r = _rows("SELECT * FROM proposals WHERE id=?", (pid,))
+  if not r:
+    return None
+  r = r[0]
+  return {"id": r["id"], "model": r["model"], "kind": r["kind"], "status": r["status"],
+          "payload": json.loads(r["payload"]), "created": r["created"]}
+
+
+def set_proposal_status(pid: str, status: str) -> None:
+  _exec("UPDATE proposals SET status=? WHERE id=?", (status, pid))
+
+
+def purge_model(model: str) -> dict:
+  """Erases all memory of a model: chat, runs, revisions, notes, proposals, origin.
+  Also clears rows left by earlier archive-style deletes (<name>@deleted-...)."""
+  counts, proposal_ids = {}, []
+  with _lock, _conn() as c:
+    proposal_ids = [r[0] for r in c.execute(
+        "SELECT id FROM proposals WHERE model=? OR model LIKE ?", (model, f"{model}@deleted-%"))]
+    for table in ("messages", "runs", "revisions", "notes", "proposals", "model_meta"):
+      cur = c.execute(f"DELETE FROM {table} WHERE model=? OR model LIKE ?", (model, f"{model}@deleted-%"))
+      counts[table] = cur.rowcount
+  return {"deleted_rows": counts, "proposal_ids": proposal_ids}

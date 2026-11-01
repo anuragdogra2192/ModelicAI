@@ -48,4 +48,5 @@ RUN printf '%s\n' 'installPackage(Modelica, "4.1.0+maint.om", exactMatch=true);'
 # Step 7: Expose port for FastAPI / MCP Server
 EXPOSE 8000
 
-CMD ["python3", "main.py"]
+#CMD ["python3", "main.py"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,29 +1,198 @@
-from agents.orchestrator import SimulationOrchestrator
+import os
+import json
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+
+from agents.orchestrator import SimulationOrchestrator, MODEL_ROOT
+from fastapi.staticfiles import StaticFiles
+from api.workspace import build_router
+from api.services import Services
+from api.agent_api import build_agent_router
+from agents.manager import build_manager
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="ModelicAI Backend",
+    description="Agentic CAE Platform API for Modelica-based simulation and visualization.",
+    version="1.0.0"
+)
+
+# Enable CORS for future React / frontend development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize the Master Simulation Orchestrator
+print("=== Initializing ModelicAI Agent Swarm ===")
+orchestrator = SimulationOrchestrator()
+
+# ModelicAI Studio: REST routes for the web UI, plus the built frontend
+# (cd frontend && npm run build  ->  ./static, served at /studio).
+app.include_router(build_router(orchestrator))
+
+# Manager Agent (LangGraph): chat, tools, human approval, SQLite checkpointer.
+manager_graph = build_manager(Services(orchestrator))
+app.include_router(build_agent_router(manager_graph))
+os.makedirs("static", exist_ok=True)
+app.mount("/studio", StaticFiles(directory="static", html=True), name="studio")
+
+
+# --- Pydantic Request Models ---
+class ChatRequest(BaseModel):
+    prompt: str
+    thread_id: Optional[str] = "default_session"
+
+class SimulateRequest(BaseModel):
+    model_name: str
+    start_time: float = 0.0
+    stop_time: float = 0.01
+    number_of_intervals: int = 500
+    method: str = "dassl"
+    parameter_overrides: Dict[str, Any] = {}
+
+
+# --- API Endpoints ---
+
+@app.get("/")
+def root():
+    return {"status": "online", "message": "Welcome to ModelicAI Agentic CAE Platform API."}
+
+
+@app.post("/api/chat")
+def chat_with_agent(req: ChatRequest):
+    """Sends user intent to the LangGraph orchestrator swarm (Designer, Validator, Solver, Visualizer)."""
+    try:
+        orchestrator.process_human_input(human_input=req.prompt, thread_id=req.thread_id)
+        return {
+            "status": "SUCCESS",
+            "model_name": orchestrator.state["model_name"],
+            "message": f"Successfully processed intent for model '{orchestrator.state['model_name']}'.",
+            "dashboard_available": orchestrator.state["dashboard_path"] is not None
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/models/{model_name}/graph")
+def get_model_graph(model_name: str):
+    """Serves the React Flow JSON graph schema for frontend diagram rendering before/after simulation."""
+    schema_path = os.path.join(MODEL_ROOT, model_name, "graph_schema.json")
+    if not os.path.exists(schema_path):
+        raise HTTPException(status_code=404, detail=f"Graph schema not found for model: {model_name}")
+    
+    with open(schema_path, "r") as f:
+        graph_data = json.load(f)
+    return graph_data
+
+
+@app.get("/api/models/{model_name}/parameters")
+def get_model_parameters(model_name: str):
+    """Serves model parameters and simulation options for the UI sidebar / property editor."""
+    model_dir = os.path.join(MODEL_ROOT, model_name)
+    mo_file = os.path.join(model_dir, f"{model_name}.mo")
+    
+    if not os.path.exists(mo_file):
+        raise HTTPException(status_code=404, detail=f"Model source not found: {model_name}")
+    
+    try:
+        orchestrator.client.omc.sendExpression(f'loadFile("{os.path.abspath(mo_file)}")')
+        parameters = orchestrator.client.get_model_parameters(model_name)
+        options = orchestrator.client.get_simulation_options(model_name)
+        return {
+            "parameters": parameters,
+            "simulation_options": options
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/models/simulate")
+def run_custom_simulation(req: SimulateRequest):
+    """Triggers solver execution directly with custom parameter overrides from the UI."""
+    try:
+        model_dir = os.path.join(MODEL_ROOT, req.model_name)
+        if not os.path.exists(model_dir):
+            raise HTTPException(status_code=404, detail=f"Model directory not found: {req.model_name}")
+        
+        orchestrator.client.omc.sendExpression(f'cd("{os.path.abspath(model_dir)}")')
+        sim_res = orchestrator.client.run_simulation(
+            model_name=req.model_name,
+            start_time=req.start_time,
+            stop_time=req.stop_time,
+            number_of_intervals=req.number_of_intervals,
+            method=req.method,
+            parameter_overrides=req.parameter_overrides
+        )
+        
+        result_file = sim_res.get("resultFile", f"{req.model_name}_res.mat")
+        
+        # Automatically re-render dashboard with new results
+        dashboard_path = orchestrator.vis_agent.render_dashboard(
+            omc_session=orchestrator.client.omc,
+            result_file=os.path.join(model_dir, result_file),
+            user_intent=f"Simulate {req.model_name} with custom overrides {req.parameter_overrides}",
+            output_dir=model_dir
+        )
+        
+        return {
+            "status": "SUCCESS",
+            "result_file": result_file,
+            "dashboard_path": dashboard_path
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/models/{model_name}/dashboard", response_class=HTMLResponse)
+def get_dashboard_html(model_name: str):
+    """Serves the interactive Plotly HTML visualization dashboard directly to the browser/iframe."""
+    dashboard_path = os.path.join(MODEL_ROOT, model_name, "interactive_dashboard.html")
+    if not os.path.exists(dashboard_path):
+        raise HTTPException(status_code=404, detail=f"Dashboard not found for model: {model_name}")
+    
+    with open(dashboard_path, "r") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content)
+
 
 if __name__ == "__main__":
-  print("=== Initializing ModelicAI Agent Swarm ===")
-  orchestrator = SimulationOrchestrator()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
-  # Unique session ID for short-term memory tracking
-  thread_id = "test-session-01"
 
-  # Test 1: Full end-to-end run
-  # (Triggers Designer -> Self-Correction Validator -> Introspector -> Solver -> Visualization)
-  print("\n--- Running Test Turn 1: Design & Simulate ---")
-  orchestrator.process_human_input(
-      "Create a simple RC electrical circuit model named RCCircuit with a DC"
-      " voltage source (10V), a resistor (100 ohm), and a capacitor (1e-6"
-      " farad) in series. Simulate it and render an interactive dashboard.",
-      thread_id=thread_id,
-  )
+# from agents.orchestrator import SimulationOrchestrator
 
-  # Test 2: Follow-up interaction leveraging short-term memory
-  # (Triggers Visualization update using the existing session result file)
-  print("\n--- Running Test Turn 2: Interactive Update ---")
-  orchestrator.process_human_input(
-      "Update the visualization dashboard layout to focus on the loop current.",
-      thread_id=thread_id,
-  )
+# if __name__ == "__main__":
+#   print("=== Initializing ModelicAI Agent Swarm ===")
+#   orchestrator = SimulationOrchestrator()
+
+#   # Unique session ID for short-term memory tracking
+#   thread_id = "test-session-01"
+
+#   # Test 1: Full end-to-end run
+#   # (Triggers Designer -> Self-Correction Validator -> Introspector -> Solver -> Visualization)
+#   print("\n--- Running Test Turn 1: Design & Simulate ---")
+#   orchestrator.process_human_input(
+#       "Create a simple RC electrical circuit model named RCCircuit with a DC"
+#       " voltage source (10V), a resistor (100 ohm), and a capacitor (1e-6"
+#       " farad) in series. Simulate it and render an interactive dashboard.",
+#       thread_id=thread_id,
+#   )
+
+#   # Test 2: Follow-up interaction leveraging short-term memory
+#   # (Triggers Visualization update using the existing session result file)
+#   print("\n--- Running Test Turn 2: Interactive Update ---")
+#   orchestrator.process_human_input(
+#       "Update the visualization dashboard layout to focus on the loop current.",
+#       thread_id=thread_id,
+#   )
 
 # import os
 # from typing import TypedDict
