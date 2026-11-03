@@ -86,8 +86,16 @@ class OpenModelicaClient:
   
   def get_simulation_options(self, model_name: str) -> dict:
     """Returns the default simulation options (startTime, stopTime, etc.)."""
+    # OMC returns a tuple: (startTime, stopTime, tolerance, numberOfIntervals, interval)
     opts = self.omc.sendExpression(f"getSimulationOptions({model_name})")
-    return opts if isinstance(opts, dict) else {"raw": str(opts)}
+    if isinstance(opts, dict):
+      return opts
+    try:
+      start, stop, tol, n, interval = (float(x) for x in opts)
+      return {"startTime": start, "stopTime": stop, "tolerance": tol,
+              "numberOfIntervals": int(round(n)), "interval": interval}
+    except (TypeError, ValueError):
+      return {"raw": str(opts)}
 
   def run_simulation(
       self,

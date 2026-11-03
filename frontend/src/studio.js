@@ -292,10 +292,12 @@ async function loadParams() {
   try {
     const r = await api(`/api/studio/models/${state.model}/parameters`);
     state.params = {...r.parameters}; state.original = {...r.parameters};
+    // Always reset the setup for the newly opened model (its experiment annotation, else OMC defaults).
     const o = r.simulation_options || {};
-    if (o.startTime!=null) $('#sStart').value = o.startTime;
-    if (o.stopTime!=null) $('#sStop').value = o.stopTime;
-    if (o.numberOfIntervals!=null) $('#sN').value = o.numberOfIntervals;
+    $('#sStart').value = o.startTime ?? 0;
+    $('#sStop').value = o.stopTime ?? 1;
+    $('#sN').value = o.numberOfIntervals ?? 500;
+    $('#sMethod').value = 'dassl';
     ['#sStart','#sStop','#sN'].forEach(id => { $(id).dataset.ok = $(id).value; }); validateSetup();
     renderParams(); if (state.scene) drawDiagram();  // fill %R-style icon labels
   } catch (e) { $('#params').innerHTML = `<div class="hint" style="padding:0">Could not read parameters: ${esc(e.message)}</div>`; }
