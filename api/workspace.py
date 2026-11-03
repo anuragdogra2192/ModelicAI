@@ -18,9 +18,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from utils.omc_graphics import DiagramBuilder
+from utils import tracing
 from api import chat_store, store
 from api.services import Services, omc_lock
 from api.bake import bake
+from utils import sim_runner
 
 MODEL_ROOT = "models"
 # Callbacks run after a model is deleted (e.g. clearing the agent's thread).
@@ -117,8 +119,11 @@ def build_router(orchestrator) -> APIRouter:
     if declared and declared.group(1) != name:
       hint = (f"The code declares model '{declared.group(1)}' but this file is '{name}'. "
               f"Keep the name '{name}', or ask Modi to create a new model.")
-    with omc_lock:
+    with omc_lock, tracing.span("omc.check", "TOOL") as sp:
       res = client.compile_model(file_path=path, model_name=name)
+      for k, v in tracing.status_attrs(res).items():
+        if v is not None:
+          sp.set_attribute(k, v)
     builder["b"] = DiagramBuilder(client.omc)
     ok = res["status"] == "SUCCESS"
     graph = regen_graph(name) if ok else None
@@ -148,6 +153,8 @@ def build_router(orchestrator) -> APIRouter:
       shutil.rmtree(os.path.join(MODEL_ROOT, ".proposals", pid), ignore_errors=True)
     for cb in on_model_deleted:
       try:
+        cb(name, purged.get("draft_ids", []))
+      except TypeError:  # hooks that take only the name
         cb(name)
       except Exception:
         pass
@@ -194,6 +201,8 @@ def build_router(orchestrator) -> APIRouter:
     number_of_intervals: int = 500
     method: str = "dassl"
     parameter_overrides: Dict[str, Any] = {}
+    timeout_s: Optional[float] = None   # None: the configured default; 0: no limit
+    force: bool = False                 # run even if the preflight estimate is above the size limit
 
   @router.post("/models/{name}/run")
   def run(name: str, req: RunRequest) -> Dict[str, Any]:
@@ -206,14 +215,21 @@ def build_router(orchestrator) -> APIRouter:
     try:
       r = services.simulate(name, {"start_time": req.start_time, "stop_time": req.stop_time,
                                    "number_of_intervals": req.number_of_intervals, "method": req.method},
-                            req.parameter_overrides, source="gui")
+                            req.parameter_overrides, source="gui", timeout_s=req.timeout_s, force=req.force)
     except ValueError as e:
       raise HTTPException(400, str(e))
+    if r["status"] == "BUSY":
+      raise HTTPException(409, r["messages"])
+    if r["status"] in ("NEEDS_CONFIRM", "STOPPED"):
+      return {k: r.get(k) for k in ("status", "reason", "messages", "estimate")}
     if r["status"] != "SUCCESS":
       diag = services.diagnose(os.path.abspath(mo_path(name)), name)
       return {"status": "FAILED", "messages": "\n".join(x for x in (r["messages"], diag) if x)}
-    return {"status": "SUCCESS", "messages": r["messages"], "timing": {"wall": r["wall"]},
-            "variables": read_variable_names(result_path(name))}
+    try:
+      names = read_variable_names(result_path(name))
+    except ResultsUnreadable as e:
+      return {"status": "FAILED", "messages": f"{r['messages']}\n{e}".strip()}
+    return {"status": "SUCCESS", "messages": r["messages"], "timing": {"wall": r["wall"]}, "variables": names}
 
   @router.get("/models/{name}/runs")
   def run_history(name: str) -> List[Dict[str, Any]]:
@@ -238,14 +254,56 @@ def build_router(orchestrator) -> APIRouter:
       return {}
     return out
 
+  # ----------------------------------------------------- running simulation
+  @router.get("/sim")
+  def sim_status() -> Dict[str, Any]:
+    """The running simulation (progress, elapsed, size) or the last one; polled by the UI."""
+    return sim_runner.status()
+
+  @router.post("/sim/stop")
+  def sim_stop() -> Dict[str, Any]:
+    return {"stopped": sim_runner.request_stop()}
+
+  class SimConfig(BaseModel):
+    timeout_s: Optional[float] = None
+    max_mb: Optional[float] = None
+
+  @router.get("/sim/config")
+  def sim_config_get() -> Dict[str, Any]:
+    return dict(sim_runner.CONFIG)
+
+  @router.put("/sim/config")
+  def sim_config(cfg: SimConfig) -> Dict[str, Any]:
+    """Timeout and size limit, used for Studio and Modi runs."""
+    if cfg.timeout_s is not None:
+      if not 0 <= cfg.timeout_s <= 86400:
+        raise HTTPException(400, "Timeout must be between 0 (no limit) and 86400 s.")
+      sim_runner.CONFIG["timeout_s"] = float(cfg.timeout_s)
+    if cfg.max_mb is not None:
+      if not 0 <= cfg.max_mb <= 100000:
+        raise HTTPException(400, "Size limit must be between 0 (no limit) and 100000 MB.")
+      sim_runner.CONFIG["max_mb"] = float(cfg.max_mb)
+    return dict(sim_runner.CONFIG)
+
+  @router.get("/models/{name}/estimate")
+  def sim_estimate(name: str, intervals: int = Query(500, ge=1, le=10_000_000)) -> Dict[str, Any]:
+    """Preflight result-size estimate from the last build (null if the model has not been built yet)."""
+    return {"estimate": sim_runner.estimate(model_dir(name), name, intervals)}
+
   @router.get("/models/{name}/variables")
   def variables(name: str) -> List[str]:
-    return read_variable_names(result_path(name))
+    try:
+      return read_variable_names(result_path(name))
+    except ResultsUnreadable as e:
+      raise HTTPException(409, str(e))
 
   @router.get("/models/{name}/results")
   def results(name: str, vars: str = Query("")) -> Dict[str, Any]:
     wanted = [v for v in vars.split(",") if v]
-    return read_series(result_path(name), wanted)
+    try:
+      return read_series(result_path(name), wanted)
+    except ResultsUnreadable as e:
+      raise HTTPException(409, str(e))
 
   # ------------------------------------------------------------------ chat
   @router.get("/models/{name}/messages")
@@ -296,8 +354,31 @@ def _http_get(url: str) -> bytes:
 
 
 # ------------------------------------------------- OMC v4 .mat result reader
+MAX_RESULT_BYTES = int(os.getenv("MAX_RESULT_MB", "300")) * 1024 * 1024
+
+
+class ResultsUnreadable(Exception):
+  """The result file is missing, too large, or incomplete (e.g. a simulation that was stopped mid-way)."""
+
+
 def _load(path: str):
-  m = sio.loadmat(path)
+  if not os.path.exists(path):
+    raise ResultsUnreadable("No results yet. Simulate the model first.")
+  size = os.path.getsize(path)
+  cfg = sim_runner.CONFIG
+  cap = (max(MAX_RESULT_BYTES, cfg["max_mb"] * 1e6, cfg.get("forced_mb", 0) * 1e6)
+         if cfg["max_mb"] > 0 else float("inf"))
+  if size > cap:
+    raise ResultsUnreadable(
+        f"The result file is {size / 1e6:.0f} MB, too large to load. This usually means the simulation "
+        "stored a huge number of points, e.g. chattering events (a bouncing ball that never comes to rest) "
+        "or too many intervals. Fix the model or reduce the intervals, then simulate again.")
+  try:
+    m = sio.loadmat(path)
+  except Exception as e:
+    raise ResultsUnreadable(
+        "The result file is incomplete or damaged (the simulation was probably stopped before it finished). "
+        f"Simulate again. Details: {type(e).__name__}: {e}")
   transposed = "Aclass" in m and "binTrans" in "".join(
       str(r) for r in m["Aclass"])
   # scipy returns char matrices as an array of equal-length strings (rows).

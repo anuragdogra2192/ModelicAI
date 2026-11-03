@@ -14,9 +14,15 @@ export default function App() {
           <option value="auto">Auto (day / night)</option>
           <optgroup label="Night"><option value="graphite">Graphite</option><option value="midnight">Midnight</option><option value="lagoon">Lagoon (turquoise)</option><option value="crimson">Crimson (red)</option><option value="forest">Forest (green)</option></optgroup>
           <optgroup label="Day"><option value="daylight">Daylight</option><option value="paper">Paper</option><option value="ocean">Ocean (blue)</option><option value="blossom">Blossom (pink)</option><option value="sunflower">Sunflower (yellow)</option><option value="eink">E-ink (grey paper)</option></optgroup>
+          <optgroup label="Accessibility"><option value="neon">Neon yellow (high contrast)</option><option value="neon-green">Neon green (high contrast)</option><option value="neon-pink">Neon pink (high contrast)</option><option value="neon-blue">Neon blue (high contrast)</option></optgroup>
         </select>
         <button className="btn" id="btnCheck" title="Save & check model (Ctrl+S)">Check <span className="kbd">⌘S</span></button>
         <button className="btn primary" id="btnSim" title="Simulate (Ctrl+Enter)">▶ Simulate <span className="kbd">⌘↵</span></button>
+        <button className="btn stop" id="btnStop" title="Stop the running simulation" disabled>■ Stop</button>
+        <div className="simprog" id="simProg" hidden>
+          <div className="bar"><div className="fill" id="simFill"></div></div>
+          <span id="simText">Simulating…</span>
+        </div>
       </header>
     
       <aside className="left">
@@ -37,7 +43,7 @@ export default function App() {
           </div>
           <div className="composer">
             <textarea id="prompt" placeholder="Ask Modi, e.g. model a double pendulum and simulate it for 10 s…" />
-            <div className="row"><span>Enter to send · Shift+Enter for a new line</span><button className="btn primary" id="btnSend" style={{height: '24px'}}>Send</button></div>
+            <div className="row"><span>Enter to send · Shift+Enter for a new line</span><button className="btn primary" id="btnSend" style={{height: '24px'}}>Send</button><button className="btn stop" id="btnStopModi" style={{height: '24px'}} hidden>■ Stop Modi</button></div>
           </div>
         </div>
       </aside>
@@ -92,6 +98,8 @@ export default function App() {
             <div className="prow"><label>Start time [s]</label><input id="sStart" defaultValue="0" /></div>
             <div className="prow"><label>Stop time [s]</label><input id="sStop" defaultValue="0.01" /></div>
             <div className="prow"><label>Intervals</label><input id="sN" defaultValue="500" /></div>
+            <div className="prow"><label title="Stop the run automatically after this many seconds (0 = no limit)">Timeout [s]</label><input id="sTimeout" defaultValue="120" /></div>
+            <div className="hint est" id="estHint"></div>
             <div className="prow"><label>Solver</label><select id="sMethod">
               <option>dassl</option><option>ida</option><option>cvode</option><option>euler</option><option>rungekutta</option><option>impeuler</option><option>gbode</option>
             </select></div>

@@ -7,8 +7,13 @@
 Run:  uvicorn main:app --host 0.0.0.0 --port 8000
 """
 import os
+import re
 
-from fastapi import FastAPI
+from utils import tracing
+
+tracing.setup()  # before the agents are built, so LangChain/LangGraph get instrumented
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +37,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# One trace per Studio action (Check, Simulate, Bake, Delete), in the model's session.
+_ACTION = re.compile(r"^/api/studio/models/([A-Za-z_]\w*)(?:/(run|bake))?$")
+
+
+@app.middleware("http")
+async def trace_actions(request: Request, call_next):
+  m = _ACTION.match(request.url.path)
+  if not tracing.enabled() or not m or request.method not in ("PUT", "POST", "DELETE"):
+    return await call_next(request)
+  action = {"PUT": "check", "DELETE": "delete"}.get(request.method) or m.group(2) or "action"
+  from api import store
+  with tracing.span(f"studio.{action}", "CHAIN", agent="studio", session=store.session_of(m.group(1)),
+                    **{"studio.action": action}) as sp:
+    response = await call_next(request)
+    sp.set_attribute("http.status_code", response.status_code)
+    return response
+
 
 print("=== Starting ModelicAI Studio ===")
 toolbox = SimulationOrchestrator()  # OMC session + designer + simulation agent + graph parser

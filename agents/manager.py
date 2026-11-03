@@ -22,13 +22,15 @@ import sqlite3
 from typing import Annotated, Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.prebuilt import InjectedState, ToolNode
 from langgraph.types import interrupt
 
+from utils import tracing
 from agents.context import build_card, render
-from agents.design_graph import build_design_graph
+from agents.design_graph import _category, build_design_graph
 from api import chat_store, store
 from api import services as svc
 
@@ -138,8 +140,13 @@ def build_manager(services: "svc.Services", llm=None, checkpointer=None):
     base_has_components = bool(re.search(r"^\s*(?:inner\s+)?Modelica\.(?!Units|SIunits)[\w.]+\s+\w+", base_code, re.M))
     rebuild_requested = bool(re.search(r"rebuild|library components|standard library|MSL", prompt, re.I))
     require = not wants_equations and (not base_code or base_has_components or rebuild_requested)
-    out = graph.invoke({"prompt": prompt, "base_code": base_code, "proposal_id": pid, "require_components": require,
-                        "code": "", "error_log": "", "prev_error": "", "status": "PENDING", "retry_count": 0})
+    with tracing.span("design.loop", "CHAIN", agent="designer",
+                      **{"design.require_components": require, "design.edit": bool(base_code), "input.value": prompt}) as sp:
+      out = graph.invoke({"prompt": prompt, "base_code": base_code, "proposal_id": pid, "require_components": require,
+                          "code": "", "error_log": "", "prev_error": "", "status": "PENDING", "retry_count": 0})
+      sp.set_attribute("design.status", out.get("status"))
+      sp.set_attribute("design.attempts", out.get("retry_count"))
+      sp.set_attribute("design.model_name", out.get("model_name") or "")
     return {"pid": pid, **out}
 
   # ------------------------------------------------------------------ tools
@@ -193,6 +200,14 @@ def build_manager(services: "svc.Services", llm=None, checkpointer=None):
     r = services.simulate(name, {"stop_time": stop_time, "start_time": start_time,
                                  "number_of_intervals": number_of_intervals, "method": method},
                           overrides or {}, source="agent")
+    if r["status"] in ("STOPPED", "NEEDS_CONFIRM", "BUSY"):
+      hints = {"STOPPED": "The run was stopped (reason: %s). Do not simulate again unless the user asks. If it hit the "
+                          "timeout or size limit, explain it in plain words (chattering events, too many intervals, long "
+                          "stop time) and offer a fix." % r.get("reason"),
+               "NEEDS_CONFIRM": "The result file would be larger than the size limit. Tell the user the estimate and "
+                                "suggest fewer intervals or a shorter stop time; they can also run it from Simulate.",
+               "BUSY": "Another simulation is running. Tell the user to wait or press Stop."}
+      return _ok(**r, hint=hints[r["status"]])
     if r["status"] != "SUCCESS":  # no new results: tell Modi why, don't ask the UI to refresh
       progress_writer()({"type": "step", "text": "Diagnosing the model structure"})
       r["diagnosis"] = services.diagnose(os.path.abspath(svc.mo_path(name)), name)
@@ -275,7 +290,8 @@ def build_manager(services: "svc.Services", llm=None, checkpointer=None):
     copy and returns a proposal for the user to approve."""
     out = run_design(description)
     if out["status"] != "SUCCESS":
-      return _ok(error=f"The model did not pass the checks after {out['retry_count']} attempts.", last_error=str(out.get("error_log"))[:1500])
+      return _ok(error=f"The model did not pass the checks after {out['retry_count']} attempts.",
+                 last_error=str(out.get("error_log"))[:1500], error_category=_category(out.get("error_log") or ""))
     name = out["model_name"]
     payload = {"code": out["code"], "model_name": name, "description": description,
                "summary": f"New model {name}" + (" (replaces existing!)" if svc.exists(name) else ""),
@@ -307,7 +323,9 @@ def build_manager(services: "svc.Services", llm=None, checkpointer=None):
   llm_tools = llm.bind_tools(tools)
 
   def _store_payload(pid, model, kind, payload):
-    import sqlite3 as _s  # keep store API small: update the draft row in place
+    import hashlib
+    if model and svc.exists(model):  # base version, so Apply can detect edits made in the meantime
+      payload = {**payload, "base_hash": hashlib.sha1(svc.read_source(model).encode()).hexdigest()}
     with store._lock, store._conn() as c:
       c.execute("UPDATE proposals SET model=?, kind=?, payload=?, status='pending' WHERE id=?",
                 (model, kind, json.dumps(payload), pid))
@@ -335,7 +353,7 @@ def build_manager(services: "svc.Services", llm=None, checkpointer=None):
         return data["proposal_id"]
     return None
 
-  def approval(state: ManagerState):
+  def approval(state: ManagerState, config: RunnableConfig):
     pid = pending_proposal(state)
     p = store.proposal(pid)
     public = {k: v for k, v in p["payload"].items() if k != "code"}
@@ -343,7 +361,8 @@ def build_manager(services: "svc.Services", llm=None, checkpointer=None):
     action = (decision or {}).get("action", "discard")
     text = (decision or {}).get("text", "")
     if action == "apply":
-      result = apply_proposal(services, p, origin=_last_user_text(state))
+      result = apply_proposal(services, p, origin=_last_user_text(state),
+                              thread=(config.get("configurable") or {}).get("thread_id"))
       store.set_proposal_status(pid, "applied")
       note = f"[system] The user APPLIED proposal {pid}. Result: {json.dumps(result, default=str)}"
       new_model = result.get("model") if p["kind"] == "new_model" else state.get("model")
@@ -395,7 +414,8 @@ def _last_user_text(state) -> str:
   return ""
 
 
-def apply_proposal(services: "svc.Services", p: Dict[str, Any], origin: str = "") -> Dict[str, Any]:
+def apply_proposal(services: "svc.Services", p: Dict[str, Any], origin: str = "",
+                   thread: Optional[str] = None) -> Dict[str, Any]:
   """Carries out an approved proposal. Returns facts for the agent and the UI."""
   pl = p["payload"]
   if p["kind"] == "edit":
@@ -405,7 +425,12 @@ def apply_proposal(services: "svc.Services", p: Dict[str, Any], origin: str = ""
     name = pl["model_name"]
     services.apply_code(name, pl["code"], "created: " + pl.get("description", "")[:120], source="agent")
     store.set_meta(name, origin_prompt=origin or pl.get("description"), purpose=pl.get("description"))
-    if origin:
+    if thread and re.match(r"^_new_[a-z0-9]{4,16}$", thread):
+      # The model inherits the draft's conversation and tracing session (one story in Phoenix).
+      chat_store.copy(thread, name)
+      store.link_model_session(name, thread)
+      store.set_draft_outcome(thread, "created", model=name)
+    elif origin:
       chat_store.add(name, "user", origin, {"origin": True})
     chat_store.add(name, "assistant", f"Created {name} from this request. It compiles; ask me to simulate or change it.",
                    {"status": "SUCCESS"})

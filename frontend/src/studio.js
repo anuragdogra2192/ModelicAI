@@ -181,10 +181,84 @@ function validateParams() {
   return ok;
 }
 function validateAll() { return validateSetup() & validateParams(); }
-['#sStart','#sStop','#sN'].forEach(id => {
+['#sStart','#sStop','#sN','#sTimeout'].forEach(id => {
   const el=$(id); el.setAttribute('inputmode','decimal'); el.setAttribute('autocomplete','off'); el.dataset.ok = el.value;
   el.addEventListener('input', () => { if (guardNumeric(el)) validateSetup(); });
 });
+
+/* ---------- simulation control: timeout, preflight estimate, progress, stop, model lock ---------- */
+const sim = { running:false, watchers:0, timer:null };
+async function loadSimConfig() {
+  try { const c = await api('/api/studio/sim/config'); $('#sTimeout').value = c.timeout_s; $('#sTimeout').dataset.ok = c.timeout_s; } catch {}
+}
+$('#sTimeout').addEventListener('change', async () => {
+  const v = +$('#sTimeout').value;
+  if (!isFinite(v) || v < 0) { fieldWarn($('#sTimeout'), 'Seconds, 0 = no limit'); return; }
+  try { await api('/api/studio/sim/config', {method:'PUT', body: JSON.stringify({timeout_s: v})}); log(`Simulation timeout: ${v ? v+' s' : 'no limit'}`, 'o'); }
+  catch (e) { log(e.message, 'e'); }
+});
+let estTimer=null;
+function updateEstimate() {
+  clearTimeout(estTimer);
+  estTimer = setTimeout(async () => {
+    const h=$('#estHint'); const n=parseInt($('#sN').value);
+    if (!state.model || !(n>0)) { h.textContent=''; return; }
+    try {
+      const {estimate:e} = await api(`/api/studio/models/${state.model}/estimate?intervals=${n}`);
+      if (!e) { h.textContent=''; h.className='hint est'; return; }
+      h.textContent = `Results ≈ ${e.mb < 1 ? '<1' : e.mb.toFixed(0)} MB (${e.variables} values × ${e.points} points)` + (e.over_limit ? ` · above the ${e.max_mb} MB limit` : '');
+      h.className = 'hint est' + (e.over_limit ? ' warn' : '');
+    } catch { h.textContent=''; }
+  }, 300);
+}
+$('#sN').addEventListener('input', updateEstimate);
+
+function applyLocks() {
+  const lock = sim.running || state.modiBusy;
+  $('#lib').classList.toggle('locked', lock); $('#btnNew').disabled = lock;
+  $('#btnStop').disabled = !sim.running;
+  for (const id of ['#btnSim','#btnCheck','#btnBake']) $(id).disabled = lock;
+}
+function lockModels(on) { sim.running = on; applyLocks(); }
+function setModiBusy(on) {
+  // While Modi works, nothing may change, compile or run the model it is using.
+  state.modiBusy = on; document.body.classList.toggle('modi-busy', on);
+  editor.setOption('readOnly', on ? 'nocursor' : false);
+  $('#btnSend').hidden = on; $('#btnStopModi').hidden = !on; $('#btnStopModi').disabled = false;
+  applyLocks();
+}
+$('#btnStopModi').onclick = async () => {
+  $('#btnStopModi').disabled = true; log('Stopping Modi…');
+  try { await api('/api/studio/agent/stop', {method:'POST'}); } catch (e) { log(e.message, 'e'); }
+};
+function showProgress(s) {
+  const p=$('#simProg'); p.hidden = !s.running;
+  if (!s.running) return;
+  const fill=$('#simFill');
+  if (s.phase==='building') { fill.classList.add('indet'); $('#simText').textContent = `Building ${s.model}… ${s.elapsed}s`; return; }
+  fill.classList.remove('indet'); fill.style.width = (100*s.progress).toFixed(1)+'%';
+  const left = s.timeout_s ? ` / ${s.timeout_s}s` : '';
+  $('#simText').textContent = `${s.model}${s.source==='agent'?' (Modi)':''} · t = ${(+s.t).toPrecision(3)} of ${s.stop} s · ${(100*s.progress).toFixed(0)}% · ${s.elapsed}s${left} · ${s.mb} MB`;
+}
+async function pollSim() {
+  try { const s = await api('/api/studio/sim'); lockModels(!!s.running); showProgress(s); }
+  catch {}
+}
+function watchSim(on) {  // poll while a Studio run or a Modi turn is active
+  sim.watchers = Math.max(0, sim.watchers + (on ? 1 : -1));
+  if (sim.watchers && !sim.timer) { pollSim(); sim.timer = setInterval(pollSim, 400); }
+  if (!sim.watchers && sim.timer) { clearInterval(sim.timer); sim.timer=null; lockModels(false); showProgress({running:false}); }
+}
+$('#btnStop').onclick = async () => {
+  $('#btnStop').disabled = true; log('Stopping the simulation…');
+  try { await api('/api/studio/sim/stop', {method:'POST'}); } catch (e) { log(e.message, 'e'); }
+};
+function modelsLocked() {
+  if (state.modiBusy) { log('Modi is working on this model. Wait for it, or press Stop Modi.', 'e'); return true; }
+  if (!sim.running) return false;
+  log('A simulation is running. Wait for it to finish or press Stop before switching models.', 'e');
+  setStatus('simulating','busy'); return true;
+}
 $('#params').addEventListener('input', e => { const el=e.target; if (!el.dataset || !el.dataset.k) return;
   if (!guardExpr(el)) { e.stopImmediatePropagation(); return; }
   state.params[el.dataset.k] = el.value;  // store first so dependent "= value" hints use the new number
@@ -197,7 +271,7 @@ $('#liveSpeed').addEventListener('change', e => { live.dur = +e.target.value; })
 
 /* ---------- themes ---------- */
 const THEMES = {graphite:{dark:true}, midnight:{dark:true}, lagoon:{dark:true}, crimson:{dark:true}, forest:{dark:true},
-  daylight:{dark:false}, paper:{dark:false}, ocean:{dark:false}, blossom:{dark:false}, sunflower:{dark:false}, eink:{dark:false}};
+  daylight:{dark:false}, paper:{dark:false}, ocean:{dark:false}, blossom:{dark:false}, sunflower:{dark:false}, eink:{dark:false}, neon:{dark:true}, 'neon-green':{dark:true}, 'neon-pink':{dark:true}, 'neon-blue':{dark:true}};
 const theme = {choice:'auto', name:'graphite', dark:true, canvas:'theme'};
 const darkMQ = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
 function applyTheme(choice, persist=true) {
@@ -239,6 +313,7 @@ async function loadLibrary() {
   } catch (e) { $('#lib').innerHTML = `<div class="hint">Backend unreachable: ${esc(e.message)}</div>`; }
 }
 $('#lib').addEventListener('click', async e => {
+  if (modelsLocked()) { e.preventDefault(); e.stopPropagation(); return; }
   const del = e.target.closest('[data-del]');
   if (del) {
     e.stopPropagation();
@@ -256,6 +331,7 @@ $('#lib').addEventListener('click', async e => {
 });
 $('#btnRefresh').onclick = loadLibrary;
 $('#btnNew').onclick = () => {
+  if (modelsLocked()) return;
   state.model=null; state.scene=null; state.graph={nodes:[],edges:[]}; state.vars=[]; state.data=null; state.params={}; state.original={};
   editor.setValue('// Describe a new system to Modi in the chat'); $('#crumbName').textContent='new model'; $('#footModel').textContent='no model';
   $('#params').innerHTML='<div class="hint" style="padding:0">Open a model to edit its parameters.</div>'; renderVars(); Plotly.purge('plot');
@@ -263,6 +339,7 @@ $('#btnNew').onclick = () => {
 };
 
 async function openModel(name) {
+  if ((sim.running || state.modiBusy) && name !== state.model) { modelsLocked(); return; }
   setStatus('loading', 'busy');
   try {
     const m = await api(`/api/studio/models/${name}`);
@@ -271,11 +348,15 @@ async function openModel(name) {
     $('#crumbName').textContent = name; $('#footModel').textContent = name;
     layoutGraph(); state.scene=null; live.data=null; drawDiagram(true); loadLibrary(); sceneReady = loadScene(true);
     log(`Opened ${name}`);
-    loadParams(); loadThread(name);
+    loadParams(); loadThread(name); updateEstimate();
     state.units = {};
-    if (m.has_results) { await loadUnits(); state.vars = await api(`/api/studio/models/${name}/variables`); defaultSelection(); renderVars(); await refreshPlot();
-      $('#runInfo').innerHTML = m.results_stale ? '<span style="color:var(--accent)">Results are older than the model. Simulate to update variables and plots.</span>' : 'Last saved results'; }
-    else { state.vars=[]; state.data=null; renderVars(); Plotly.purge('plot'); $('#runInfo').textContent='No results'; }
+    if (m.has_results) {
+      try { await loadUnits(); state.vars = await api(`/api/studio/models/${name}/variables`); defaultSelection(); renderVars(); await refreshPlot();
+        $('#runInfo').innerHTML = m.results_stale ? '<span style="color:var(--accent)">Results are older than the model. Simulate to update variables and plots.</span>' : 'Last saved results'; }
+      catch (e) { log(e.message, 'e'); state.vars=[]; state.data=null; renderVars(); Plotly.purge('plot');
+        $('#runInfo').innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+    }
+    if (!m.has_results) { state.vars=[]; state.data=null; renderVars(); Plotly.purge('plot'); $('#runInfo').textContent='No results'; }
     live.stale = !!m.results_stale; liveStop(); sceneReady.then(prepareLive);
     setStatus('ready', 'ok');
   } catch (e) { setStatus('error','err'); log(e.message,'e'); }
@@ -758,15 +839,28 @@ async function check() {
   } catch (e) { setStatus('error','err'); log(e.message,'e'); return false; }
 }
 async function simulate() {
+  if (state.modiBusy) { log('Modi is working. Wait for it, or press Stop Modi.', 'e'); return; }
   if (!state.model) { log('Open or generate a model first','e'); return; }
   if (!validateAll()) { setStatus('fix inputs','err'); log('Fix the highlighted fields first: numbers only', 'e'); return; }
   if (editor.getValue()!==state.code && !(await check())) return;
   const body = { start_time:+$('#sStart').value, stop_time:+$('#sStop').value, number_of_intervals:parseInt($('#sN').value),
-    method:$('#sMethod').value, parameter_overrides: overrides() };
-  setStatus('simulating','busy'); $('#btnSim').disabled=true; const t0=performance.now();
+    method:$('#sMethod').value, parameter_overrides: overrides(), timeout_s: +$('#sTimeout').value };
+  setStatus('simulating','busy'); $('#btnSim').disabled=true; const t0=performance.now(); watchSim(true);
   log(`Simulating ${state.model} [${body.start_time}, ${body.stop_time}] s with ${body.method}` + (Object.keys(body.parameter_overrides).length ? ` · overrides ${JSON.stringify(body.parameter_overrides)}` : ''));
   try {
-    const r = await api(`/api/studio/models/${state.model}/run`, {method:'POST', body: JSON.stringify(body)});
+    let r = await api(`/api/studio/models/${state.model}/run`, {method:'POST', body: JSON.stringify(body)});
+    if (r.status==='NEEDS_CONFIRM') {
+      const e=r.estimate||{};
+      if (!window.confirm(`${r.messages}\n\nRun anyway? Otherwise reduce the intervals or the stop time.`)) {
+        setStatus('ready','ok'); log(`Not run: results would be about ${Math.round(e.mb)} MB`, 'e'); return; }
+      r = await api(`/api/studio/models/${state.model}/run`, {method:'POST', body: JSON.stringify({...body, force:true})});
+    }
+    if (r.status==='STOPPED') {
+      setStatus(r.reason==='user' ? 'stopped' : 'sim stopped', r.reason==='user' ? '' : 'err'); log(r.messages.split('\n')[0], r.reason==='user' ? '' : 'e');
+      $('#runInfo').innerHTML = `<span style="color:var(--err)">${esc(r.messages.split('\n')[0])}</span> Previous results kept.`;
+      if (r.reason!=='user') offerFix('simulation', r.messages);
+      return;
+    }
     if (r.status!=='SUCCESS') throw new Error(r.messages || 'Simulation failed');
     if (r.messages) log(r.messages.trim());
     state.vars = r.variables; if (!state.selected.size || ![...state.selected].some(v=>state.vars.includes(v))) defaultSelection();
@@ -775,11 +869,12 @@ async function simulate() {
     $('#runInfo').textContent = `${state.model} · ${body.method} · ${body.number_of_intervals} intervals · ${dt}s wall`;
     setStatus('done','ok'); log(`Simulation finished in ${dt}s`,'o'); loadLibrary();
   } catch (e) { setStatus('sim failed','err'); log(e.message,'e'); offerFix('simulation', e.message); }
-  finally { $('#btnSim').disabled=false; }
+  finally { watchSim(false); $('#btnSim').disabled=false; updateEstimate(); }
 }
 $('#btnCheck').onclick = check; $('#btnSim').onclick = simulate;
 addEventListener('keydown', e => {
   const mod = e.metaKey||e.ctrlKey;
+  if (mod && (e.key==='s' || e.key==='Enter') && state.modiBusy) { e.preventDefault(); log('Modi is working. Wait for it, or press Stop Modi.', 'e'); return; }
   if (mod && e.key==='s') { e.preventDefault(); check(); }
   if (mod && e.key==='Enter') { e.preventDefault(); simulate(); }
 });
@@ -821,7 +916,7 @@ function drawPlot() {
   const traces=[];
   const vars=Object.keys(d.series).filter(v=>d.series[v]);
   const units=[...new Set(vars.map(unitOf))];
-  vars.forEach((v,i) => traces.push({x:d.time, y:d.series[v], name:v, mode:'lines', line:{color:P[i%P.length], width:2}, yaxis: units.indexOf(unitOf(v))===1?'y2':'y'}));
+  vars.forEach((v,i) => traces.push({x:d.time, y:d.series[v], name:v, mode:'lines', line:{color:P[i%P.length], width:theme.name.startsWith('neon')?3:2, dash:theme.name.startsWith('neon')?['solid','dash','dot','dashdot','longdash','longdashdot'][i%6]:'solid'}, yaxis: units.indexOf(unitOf(v))===1?'y2':'y'}));
   state.pins.forEach((p,pi) => Object.keys(p.series).forEach(v => { if (!p.series[v] || !vars.includes(v)) return; const i=vars.indexOf(v);
     traces.push({x:p.time, y:p.series[v], name:`${v} · ${p.label}`, mode:'lines', line:{color:P[i%P.length], width:1.4, dash:['dash','dot','dashdot'][pi%3]}, opacity:.7, yaxis: units.indexOf(unitOf(v))===1?'y2':'y'}); }));
   const mono='IBM Plex Mono, ui-monospace, monospace';
@@ -897,7 +992,7 @@ const TOOL_LABEL = {read_model:'Reading the model', read_results:'Reading result
   plan_simulation:'Simulation agent: planning the run', propose_edit:'Designing the change', propose_new_model:'Designing a new model',
   set_parameters:'Filling parameters', plot:'Updating the plot', remember_note:'Noting that'};
 async function runAgent(path, body) {
-  $('#suggest').style.display='none'; setStatus('Modi is working','busy'); $('#btnSend').disabled=true;
+  $('#suggest').style.display='none'; setStatus('Modi is working','busy'); $('#btnSend').disabled=true; setModiBusy(true); watchSim(true);
   const run = addMsg('bot run', '<div class="steps"></div>'); const steps = run.querySelector('.steps');
   const addStep = (text, cls='run', detail) => { steps.querySelectorAll('.s.run').forEach(s=>s.className='s done');
     const last=steps.lastElementChild;
@@ -922,7 +1017,7 @@ async function runAgent(path, body) {
     setStatus('ready','ok');
     if (failed) { setStatus(failed.kind==='check' ? 'check failed' : 'sim failed', 'err'); offerFix(failed.kind, failed.message); }
   } catch (err) { run.remove(); addMsg('bot err', 'Something went wrong: '+esc(err.message)); setStatus('Modi failed','err'); log(err.message,'e'); }
-  finally { $('#btnSend').disabled=false; }
+  finally { $('#btnSend').disabled=false; setModiBusy(false); watchSim(false); }
   if (reload) { await loadLibrary(); await openModel(reload); }
 }
 async function uiAction(e) {
@@ -950,10 +1045,28 @@ function approvalCard(p) {
   if (p.diff) body += `<details><summary>Show diff</summary><pre class="diff">${esc(p.diff).split('\n').map(l=>`<span class="${l.startsWith('+')&&!l.startsWith('+++')?'add':l.startsWith('-')&&!l.startsWith('---')?'del':''}">${l}</span>`).join('\n')}</pre></details>`;
   body += `<div class="pbtns"><button class="btn primary" data-a="apply">Apply</button><button class="btn" data-a="discard">Discard</button><span class="pmeta">or reply below to refine</span></div>`;
   el.innerHTML = body;
-  el.querySelectorAll('[data-a]').forEach(b => b.onclick = () => {
+  const decide = (action, text='') => {
     el.querySelectorAll('button').forEach(x=>x.disabled=true); el.classList.add('past');
-    addMsg('user', b.dataset.a==='apply' ? 'Apply' : 'Discard');
-    runAgent('/api/studio/agent/resume', {model: state.model || state.draft, proposal_id: p.proposal_id, action: b.dataset.a});
+    addMsg('user', action==='apply' ? 'Apply' : action==='discard' ? 'Discard' : esc(text));
+    runAgent('/api/studio/agent/resume', {model: state.model || state.draft, proposal_id: p.proposal_id, action, text});
+  };
+  el.querySelectorAll('[data-a]').forEach(b => b.onclick = async () => {
+    if (b.dataset.a !== 'apply') return decide(b.dataset.a);
+    // Did the model change since Modi made this proposal? Then Apply would overwrite those changes.
+    let stale = false;
+    try { stale = (await api(`/api/studio/agent/proposal/${p.proposal_id}/check`)).stale; } catch {}
+    const unsaved = p.model && p.model===state.model && editor.getValue()!==state.code;
+    if (!stale && !unsaved) return decide('apply');
+    el.querySelector('.pconflict')?.remove();
+    const w = document.createElement('div'); w.className='pconflict';
+    w.innerHTML = `<div>${stale ? 'The model changed after Modi made this proposal' : 'You have unsaved edits in the editor'}. Applying it would overwrite ${stale ? 'those changes' : 'them'}.</div>
+      <div class="pbtns"><button class="btn" data-c="force">Apply anyway</button><button class="btn primary" data-c="redo">Redo on the current version</button></div>`;
+    el.appendChild(w);
+    w.querySelector('[data-c="force"]').onclick = () => decide('apply');
+    w.querySelector('[data-c="redo"]').onclick = async () => {
+      if (unsaved && !(await check())) return;  // save the editor first so Modi sees the current version
+      decide('refine', 'The model changed since this proposal was made. Redo the same change on the current version of the model.');
+    };
   });
 }
 function offerFix(kind, message) {
@@ -976,5 +1089,6 @@ $('#prompt').addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftK
 $('#suggest').addEventListener('click', e => { if (e.target.tagName==='BUTTON') send(e.target.textContent); });
 
 /* ---------- boot ---------- */
+loadSimConfig(); pollSim();
 loadLibrary().then(async () => { const first=document.querySelector('#lib button'); if (first) openModel(first.dataset.m); else loadThread(null); });
 }

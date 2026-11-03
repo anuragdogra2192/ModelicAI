@@ -12,6 +12,8 @@ from typing import Callable, Optional, TypedDict
 from langgraph.graph import END, StateGraph
 
 from api import services as svc
+from api import cancel
+from utils import tracing
 
 
 class DesignState(TypedDict, total=False):
@@ -51,6 +53,18 @@ def _same_error(a: str, b: str) -> bool:
   return bool(a and b) and norm(a) == norm(b)
 
 
+def _category(err: str) -> str:
+  """Coarse failure class for filtering in Phoenix."""
+  rules = [("structure", r"STRUCTURE CHECK"), ("unbalanced", r"equation\(s\) and \d+ variable|under-determined|over-determined"),
+           ("initialization", r"initialization failed|initial"), ("connector", r"connect|connector|incompatible"),
+           ("syntax", r"syntax|parse|expected|missing token"), ("lookup", r"not found|lookup|undeclared|class .* not"),
+           ("runtime", r"division by zero|assert|integrator|solver failed")]
+  for name, pat in rules:
+    if re.search(pat, err, re.I):
+      return name
+  return "other"
+
+
 def build_design_graph(designer, check_file: Callable[[str, str], dict],
                        progress: Callable[[dict], None] = lambda e: None,
                        count_components: Optional[Callable[[str, str], list]] = None,
@@ -68,6 +82,18 @@ def build_design_graph(designer, check_file: Callable[[str, str], dict],
     return error
 
   def designer_node(state: DesignState) -> DesignState:
+    with tracing.span("designer.attempt", "AGENT", agent="designer",
+                      **{"design.attempt": state.get("retry_count", 0) + 1,
+                         "design.edit": bool(state.get("base_code")),
+                         "input.value": state.get("error_log") or state["prompt"]}) as sp:
+      out = _designer(state)
+      sp.set_attribute("design.same_error", "SAME error" in (out.get("error_log") or "") or
+                       _same_error(state.get("error_log") or "", state.get("prev_error", "")))
+      sp.set_attribute("output.value", (out.get("code") or "")[:4000])
+      return out
+
+  def _designer(state: DesignState) -> DesignState:
+    cancel.check()  # the user pressed Stop: end the loop before the next LLM call
     attempt = state.get("retry_count", 0) + 1
     progress({"type": "step", "text": f"Designer: writing Modelica (attempt {attempt}/{MAX_RETRIES})"})
     request = state["prompt"]
@@ -88,6 +114,21 @@ def build_design_graph(designer, check_file: Callable[[str, str], dict],
     return {**state, "code": code, "retry_count": attempt, "prev_error": state.get("error_log") or ""}
 
   def validator_node(state: DesignState) -> DesignState:
+    with tracing.span("validator", "CHAIN", agent="validator",
+                      **{"design.attempt": state.get("retry_count", 0)}) as sp:
+      out = _validator(state)
+      err = out.get("error_log") or ""
+      gate = ("structure" if err.startswith("STRUCTURE") else "smoke_test" if err.startswith("SIMULATION TEST")
+              else "compile" if out["status"] != "SUCCESS" else None)
+      sp.set_attribute("design.status", out["status"])
+      sp.set_attribute("design.model_name", out.get("model_name") or "")
+      if gate:
+        sp.set_attribute("design.failed_gate", gate)
+        sp.set_attribute("design.error", err[:3000])
+        sp.set_attribute("error.category", _category(err))
+      return out
+
+  def _validator(state: DesignState) -> DesignState:
     code = state["code"]
     name = svc.model_name_from_code(code) or "Model"
     folder = os.path.join(svc.PROPOSAL_ROOT, state["proposal_id"])

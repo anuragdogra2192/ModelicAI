@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from api import store
+from utils import sim_runner
+from utils.tracing import status_attrs, traced
 
 MODEL_ROOT = "models"
 PROPOSAL_ROOT = os.path.join(MODEL_ROOT, ".proposals")
@@ -109,10 +111,12 @@ class Services:
     self.client = orchestrator.client
 
   # ---------------------------------------------------------------- OMC
+  @traced("omc.check", out=status_attrs)
   def check_file(self, path: str, name: str) -> Dict[str, str]:
     with omc_lock:
       return self.client.compile_model(file_path=path, model_name=name)
 
+  @traced("omc.components", out=lambda r: {"omc.component_count": len(r), "omc.components": r})
   def components(self, path: str, name: str) -> List[str]:
     """Names of real component instances (not parameters, constants, plain variables or SI types)."""
     from utils.omc_graphics import parse, BUILTIN
@@ -142,6 +146,7 @@ class Services:
       out.append(nm)
     return out
 
+  @traced("omc.diagnose", out=lambda r: {"output.value": r})
   def diagnose(self, path: str, name: str) -> str:
     """Structural diagnosis for unbalanced / failing models: which connectors are not connected.
     An unconnected causal input (RealInput, BooleanInput, ...) is the classic cause of 'too few equations';
@@ -185,37 +190,31 @@ class Services:
                    "start value/initial equation, or a parameter set to a value that removes an equation.")
     return "STRUCTURAL DIAGNOSIS: " + " | ".join(parts)
 
+  @traced("omc.smoke_test", out=lambda r: {**status_attrs(r), "omc.stop_time": r.get("stop_time")})
   def smoke_test(self, path: str, name: str) -> Dict[str, Any]:
     """Short trial simulation of a scratch model (proposal folder) to catch initialization and runtime
-    errors that checkModel cannot see. Results stay in the scratch folder."""
+    errors that checkModel cannot see. Same watchdog as real runs (timeout, size cap, chattering hint);
+    results stay in the scratch folder."""
     code = open(path).read()
     m = re.search(r"StopTime\s*=\s*([0-9.eE+-]+)", code)
     stop = float(m.group(1)) if m else 1.0
     stop = stop if 0 < stop < 1e7 else 1.0
     folder = os.path.dirname(os.path.abspath(path))
     try:
-      with omc_lock:
-        self.client.omc.sendExpression(f'loadFile("{os.path.abspath(path)}")')
-        self.client.omc.sendExpression(f'cd("{folder}")')
-        raw = self.client.omc.sendExpression(
-            f'simulate({name}, startTime=0.0, stopTime={stop}, numberOfIntervals=200, method="dassl", simflags="")')
-        self.client.omc.sendExpression(f'cd("{os.path.abspath(".")}")')
+      res = sim_runner.run(self.client, omc_lock, path, name,
+                           {"start_time": 0.0, "stop_time": stop, "number_of_intervals": 200, "method": "dassl"}, {},
+                           os.path.join(folder, f"{name}_res.mat"), source="design",
+                           timeout_s=float(os.getenv("SMOKE_TIMEOUT_S", "30")), force=True, track=False)
     except Exception as e:
       return {"status": "FAILED", "messages": clean_omc_error(str(e)), "stop_time": stop}
-    info = raw if isinstance(raw, dict) else {"messages": str(raw)}
-    res = info.get("resultFile") or ""
-    msgs = str(info.get("messages", ""))
-    ok = bool(res) and os.path.exists(res if os.path.isabs(res) else os.path.join(folder, os.path.basename(res)))
-    # OMC can write a result file and still report a solver/initialization failure in the messages.
-    if ok and re.search(r"(simulation terminated by an assert|initialization failed|integrator failed|"
-                        r"solver failed|division by zero|nonlinear solver failed)", msgs, re.I):
-      ok = False
-    return {"status": "SUCCESS" if ok else "FAILED", "messages": clean_omc_error(msgs)[-1200:] if not ok else "",
-            "stop_time": stop}
+    ok = res["status"] == "SUCCESS"
+    return {"status": "SUCCESS" if ok else "FAILED", "stop_time": stop,
+            "messages": "" if ok else clean_omc_error(res.get("messages", ""))[-1200:]}
 
   def validate(self, name: str) -> Dict[str, str]:
     return self.check_file(os.path.abspath(mo_path(name)), name)
 
+  @traced("omc.parameters")
   def parameters(self, name: str) -> Dict[str, Any]:
     with omc_lock:
       self.client.omc.sendExpression(f'loadFile("{os.path.abspath(mo_path(name))}")')
@@ -233,29 +232,40 @@ class Services:
     except Exception:
       return {"start_time": 0.0, "stop_time": 1.0, "number_of_intervals": 500, "method": "dassl"}
 
+  @traced("omc.simulate", out=lambda r: {**status_attrs(r), "omc.wall_s": r.get("wall"), "sim.settings": r.get("settings"), "sim.overrides": r.get("overrides")})
   def simulate(self, name: str, settings: Optional[Dict[str, Any]] = None,
-               overrides: Optional[Dict[str, Any]] = None, source: str = "gui") -> Dict[str, Any]:
+               overrides: Optional[Dict[str, Any]] = None, source: str = "gui",
+               timeout_s: Optional[float] = None, force: bool = False) -> Dict[str, Any]:
+    """Runs through utils.sim_runner (stoppable, timeout, size cap, progress). status: SUCCESS | FAILED |
+    STOPPED (user/timeout/too_large) | NEEDS_CONFIRM (preflight estimate above the cap) | BUSY."""
     s = {**self.default_settings(name), **{k: v for k, v in (settings or {}).items() if v is not None}}
     s = validate_settings(s)
     ov = _sanitize_overrides(overrides)
     path = os.path.abspath(mo_path(name))
-    flags = ("-override=" + ",".join(f"{k}={v}" for k, v in ov.items())) if ov else ""
-    t0 = time.time()
     try:
-      with omc_lock:
-        self.client.omc.sendExpression(f'loadFile("{path}")')
-        self.client.omc.sendExpression(f'cd("{os.path.dirname(path)}")')
-        raw = self.client.omc.sendExpression(
-            f'simulate({name}, startTime={float(s["start_time"])}, stopTime={float(s["stop_time"])}, '
-            f'numberOfIntervals={int(s["number_of_intervals"])}, method="{s["method"]}", simflags="{flags}")')
-    except Exception as e:  # newer OMPython raises on OMC errors instead of returning them
-      raw = {"resultFile": "", "messages": clean_omc_error(str(e))}
-    wall = round(time.time() - t0, 3)
-    info = raw if isinstance(raw, dict) else {"messages": str(raw)}
-    ok = bool(info.get("resultFile")) and os.path.exists(result_path(name))
-    metrics = self.metrics(name) if ok else {}
-    store.add_run(name, s, ov, "SUCCESS" if ok else "FAILED", metrics, wall, source)
-    return {"status": "SUCCESS" if ok else "FAILED", "settings": s, "overrides": ov, "wall": wall,
+      res = sim_runner.run(self.client, omc_lock, path, name, s, ov, result_path(name), source=source,
+                           timeout_s=timeout_s, force=force)
+    except sim_runner.Busy as e:
+      return {"status": "BUSY", "settings": s, "overrides": ov, "wall": 0, "messages": str(e), "metrics": {}}
+    except sim_runner.NeedsConfirm as e:
+      return {"status": "NEEDS_CONFIRM", "settings": s, "overrides": ov, "wall": 0, "messages": str(e), "metrics": {},
+              "estimate": {"mb": round(e.estimate_mb, 1), "variables": e.n_vars, "points": e.points,
+                           "max_mb": sim_runner.CONFIG["max_mb"]}}
+    except Exception as e:  # OMC errors while building
+      res = {"status": "FAILED", "reason": "build", "wall": 0, "messages": clean_omc_error(str(e))}
+    wall = res["wall"]
+    info = {"messages": clean_omc_error(res.get("messages", ""))}
+    ok = res["status"] == "SUCCESS"
+    metrics = {}
+    if ok:
+      try:
+        metrics = self.metrics(name)
+      except Exception as e:  # result file too large or incomplete: report it as a failed run
+        ok = False
+        info["messages"] = f"{info.get('messages', '')}\n{e}".strip()
+    status = "SUCCESS" if ok else ("STOPPED" if res["status"] == "STOPPED" else "FAILED")
+    store.add_run(name, s, ov, status, metrics, wall, source)
+    return {"status": status, "reason": res.get("reason"), "settings": s, "overrides": ov, "wall": wall,
             "messages": str(info.get("messages", ""))[-1500:], "metrics": metrics}
 
   # ------------------------------------------------------------ results

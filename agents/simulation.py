@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from utils.tracing import traced
+
 SOLVERS = ["dassl", "ida", "cvode", "euler", "heun", "rungekutta", "impeuler", "trapezoid", "imprungekutta", "gbode"]
 MAX_INTERVALS = 100_000
 
@@ -39,6 +41,11 @@ class SimulationAgent:
       ' "parameter_overrides": {"name": <number>}, "reason": "<one sentence: which time scale you used>"}'
   )
 
+  @traced("simulation_agent", kind="AGENT", agent="simulation",
+          out=lambda c: {"sim.stop_time": c.get("stopTime"), "sim.intervals": c.get("numberOfIntervals"),
+                         "sim.method": c.get("method"), "sim.checks": c.get("checks"),
+                         "sim.fallback": any("experiment annotation" in x for x in c.get("checks", [])),
+                         "output.value": c.get("reason")})
   def suggest_simulation_config(self, model_name: str, parameters: dict, user_intent: str,
                                 context: Optional[dict] = None) -> dict:
     context = context or {}

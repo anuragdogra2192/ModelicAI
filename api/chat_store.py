@@ -56,6 +56,15 @@ def move(from_model: str, to_model: str, since_id: int) -> None:
               (to_model, from_model or WORKSPACE, since_id))
 
 
+def copy(from_model: str, to_model: str) -> int:
+  """Copies a conversation (a draft that produced a model) into another thread. The draft keeps its own."""
+  with _lock, _conn() as c:
+    cur = c.execute("INSERT INTO messages (model, role, content, meta, created) "
+                    "SELECT ?, role, content, meta, created FROM messages WHERE model = ? ORDER BY id",
+                    (to_model, from_model))
+    return cur.rowcount
+
+
 def context_block(model: str, turns: int = 6) -> str:
   """Recent conversation as plain text, for prompts to agents without chat memory."""
   msgs = [m for m in history(model, turns) if m["role"] in ("user", "assistant")]

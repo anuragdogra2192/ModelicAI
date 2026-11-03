@@ -1,0 +1,29 @@
+# ModelicAI Studio + Arize Phoenix (tracing, sessions, evals).
+#   docker compose up --build        Studio: http://localhost:8000   Phoenix: http://localhost:6006
+# Without Phoenix, keep using `docker build` / `docker run` as before: tracing stays off.
+services:
+  studio:
+    build: .
+    ports: ["8000:8000"]
+    env_file:
+      - path: .env                    # optional: ANTHROPIC_API_KEY, MODEL_NAME, ...
+        required: false
+    environment:
+      ANTHROPIC_API_KEY:              # from your shell (if set), otherwise from .env
+      MODEL_NAME:
+      PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006/v1/traces
+      PHOENIX_PROJECT_NAME: modelicai-studio
+      GIT_COMMIT: ${GIT_COMMIT:-dev}  # GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up --build
+      PROMPT_VERSION: ${PROMPT_VERSION:-1}
+    depends_on: [phoenix]
+
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports: ["6006:6006"]              # UI + trace collector (HTTP)
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    volumes:
+      - phoenix_data:/mnt/data        # traces survive restarts
+
+volumes:
+  phoenix_data:
