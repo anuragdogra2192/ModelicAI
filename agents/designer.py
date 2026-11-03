@@ -1,6 +1,5 @@
 import os
 from langchain_core.messages import HumanMessage, SystemMessage
-#from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 
 class DesignAgent:
