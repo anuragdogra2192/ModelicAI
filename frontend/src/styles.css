@@ -239,7 +239,7 @@ input,select,textarea{font:inherit;color:var(--text)}
 .simprog .fill.indet{width:35%;animation:simind 1.2s linear infinite}
 @keyframes simind{from{margin-left:-35%}to{margin-left:100%}}
 #lib.locked button{opacity:.45;cursor:not-allowed}
-#btnStopModi[hidden]{display:none}
+#btnStopModi[hidden],#btnSend[hidden]{display:none}
 body.modi-busy .CodeMirror{opacity:.75}
 body.modi-busy #params input{opacity:.6;pointer-events:none}
 .modi-note{font-size:11px;color:var(--accent);padding:2px 8px}

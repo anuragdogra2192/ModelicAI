@@ -1,0 +1,46 @@
+# ---- Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# ---- Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- ModelicAI runtime data (chat history, Modi memory, checkpoints)
+data/
+
+# ---- Models: user workspace (Modelica sources, OpenModelica build output, proposals, trash)
+models/
+*.mo
+
+# ---- OpenModelica artifacts written to the repo root (old pipeline, scripts)
+temp_model.mo
+*.libs
+*.makefile
+*_res.mat
+*_init.xml
+*_info.json
+*_JacA.bin
+
+# ---- Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+static/
+/package-lock.json
+npm-debug.log*
+
+# ---- OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

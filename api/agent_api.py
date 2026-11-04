@@ -262,9 +262,14 @@ def build_agent_router(graph) -> APIRouter:
                        {"type": "done", "model": None if (thread == chat_store.WORKSPACE or is_draft(thread)) else thread,
                         "pending": bool(_pending(thread))}]))
     if _pending(thread):
-      # A proposal is waiting: treat the message as a refinement request.
+      # A proposal is waiting. A plain "apply"/"yes" or "discard"/"no" typed in the chat is the same as the
+      # card's buttons; anything else asks Modi to refine the proposal.
       chat_store.add(thread, "user", req.message)
-      return sse(run(Command(resume={"action": "refine", "text": req.message}), thread, "refine", req.message))
+      word = req.message.strip().lower().rstrip(".!")
+      action = ("apply" if word in ("apply", "yes", "ok", "okay", "approve", "accept", "do it", "go ahead", "apply it")
+                else "discard" if word in ("discard", "no", "reject", "cancel", "discard it") else "refine")
+      return sse(run(Command(resume={"action": action, "text": "" if action != "refine" else req.message}),
+                     thread, "decision." + action if action != "refine" else "refine", req.message))
     chat_store.add(thread, "user", req.message)
     graph_input = {"messages": [HumanMessage(content=req.message)],
                    "model": None if (thread == chat_store.WORKSPACE or is_draft(thread)) else thread, "ui": req.ui}

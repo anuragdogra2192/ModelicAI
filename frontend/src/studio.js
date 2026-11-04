@@ -241,13 +241,19 @@ function showProgress(s) {
   $('#simText').textContent = `${s.model}${s.source==='agent'?' (Modi)':''} · t = ${(+s.t).toPrecision(3)} of ${s.stop} s · ${(100*s.progress).toFixed(0)}% · ${s.elapsed}s${left} · ${s.mb} MB`;
 }
 async function pollSim() {
-  try { const s = await api('/api/studio/sim'); lockModels(!!s.running); showProgress(s); }
-  catch {}
+  // The server is the source of truth: keep polling while a run is active (also one that outlives a
+  // Modi turn), stop once nothing is running and nobody is watching. A late, stale "running" reply
+  // just restarts polling, and the next poll unlocks again, so the lock can't get stuck.
+  let s;
+  try { s = await api('/api/studio/sim'); } catch { return; }
+  lockModels(!!s.running); showProgress(s);
+  if (s.running && !sim.timer) sim.timer = setInterval(pollSim, 400);
+  if (!s.running && !sim.watchers && sim.timer) { clearInterval(sim.timer); sim.timer = null; }
 }
 function watchSim(on) {  // poll while a Studio run or a Modi turn is active
   sim.watchers = Math.max(0, sim.watchers + (on ? 1 : -1));
-  if (sim.watchers && !sim.timer) { pollSim(); sim.timer = setInterval(pollSim, 400); }
-  if (!sim.watchers && sim.timer) { clearInterval(sim.timer); sim.timer=null; lockModels(false); showProgress({running:false}); }
+  if (sim.watchers && !sim.timer) sim.timer = setInterval(pollSim, 400);
+  pollSim();
 }
 $('#btnStop').onclick = async () => {
   $('#btnStop').disabled = true; log('Stopping the simulation…');
@@ -255,7 +261,8 @@ $('#btnStop').onclick = async () => {
 };
 function modelsLocked() {
   if (state.modiBusy) { log('Modi is working on this model. Wait for it, or press Stop Modi.', 'e'); return true; }
-  if (!sim.running) return false;
+  if (!sim.running) { applyLocks(); return false; }  // re-sync the look with the real state
+  pollSim();  // double-check with the server: if nothing runs, this unlocks and the next click works
   log('A simulation is running. Wait for it to finish or press Stop before switching models.', 'e');
   setStatus('simulating','busy'); return true;
 }
@@ -516,6 +523,7 @@ function applyDynamic(svg) {
 let sceneReady = Promise.resolve();
 const live = {data:null, t:null, idx:0, playing:false, raf:0, last:0, phase:{}, keys:{}, flows:[], range:{}, stale:false, dur:6};
 const LIVE_PREFS = ['v','i','s','v_rel','s_rel','w','phi','w_rel','T','f','tau','y','Q_flow','m_flow','p','LossPower'];
+const VEC_PREFS = ['r_rel_a','r_0','v_rel_a','v_0','w_rel_b','phi','f'];
 const PREFIXABLE = new Set(['V','A','W','N','Pa','J','F','H','Ohm','Hz','s','m','g','C','S','Wb','T','N.m','m/s','rad/s']);
 function fmtVal(x, unit) {
   // SI prefixes only for units where they read naturally (mV, kN, µF); otherwise plain numbers with the unit.
@@ -541,7 +549,14 @@ async function prepareLive() {
   if (live.stale) return liveHide('Results are older than the model. Simulate to see live values.');
   const vars=new Set(state.vars), keys={}, flows=[];
   const comps = state.scene ? state.scene.components : [];
-  comps.forEach(c => { keys[c.name] = LIVE_PREFS.map(p=>`${c.name}.${p}`).filter(v=>vars.has(v)).slice(0,2); });
+  comps.forEach(c => {
+    keys[c.name] = LIVE_PREFS.map(p=>`${c.name}.${p}`).filter(v=>vars.has(v)).slice(0,2);
+    if (!keys[c.name].length) {
+      // 3D/vector components (MultiBody): positions and speeds are arrays such as r_rel_a[3], r_0[3], v_0[3]
+      const vec = VEC_PREFS.flatMap(p => [1,2,3].map(k => `${c.name}.${p}[${k}]`)).filter(v => vars.has(v));
+      keys[c.name] = vec.slice(0, 3);
+    }
+  });
   if (!comps.length) keys['@model'] = state.vars.filter(v => !v.includes('.') && !v.startsWith('der(')).slice(0,6);
   (state.scene ? state.scene.wires : []).forEach((w,i) => {
     for (const [end, sign] of [[w.from, 1], [w.to, -1]]) {
@@ -679,14 +694,20 @@ function sceneBBox() {
   return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
 }
 const mapPt = (m,u,v) => [m[0]*u+m[2]*v+m[4], m[1]*u+m[3]*v+m[5]];
+function labelValue(v) {
+  // A modifier can refer to model parameters (R=R, c=2*k, J=(2/5)*m*R^2): show the evaluated number.
+  const raw = String(v).trim().replace(/^=\s*/, '');
+  if (NUM_FULL.test(raw)) return raw;
+  try { const x = evalExpr(raw, null); if (isFinite(x)) return String(+x.toPrecision(6)); } catch {}
+  return raw;  // e.g. a Medium or a string: show it as written rather than the %placeholder
+}
 function substitute(t, name) {
   return t.replace(/%(name|class|[A-Za-z_][\w.]*)/g, (all, key) => {
     if (key==='name') return name;
     if (key==='class') { const c=state.scene.components.find(c=>c.name===name); return c ? c.type.split('.').pop() : ''; }
     const comp = state.scene.components.find(c=>c.name===name) || {};
     let v = state.params[`${name}.${key}`] ?? (comp.modifiers||{})[key] ?? (comp.defaults||{})[key];
-    if (v!=null && /^[A-Za-z_]\w*$/.test(String(v)) && state.params[v]!=null) v = state.params[v];  // c=k -> c=10
-    return v==null ? all : String(v);
+    return v==null ? all : labelValue(v);
   }).replace(/%%/g,'%');
 }
 function drawScene(fit) {
@@ -1089,6 +1110,7 @@ $('#prompt').addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftK
 $('#suggest').addEventListener('click', e => { if (e.target.tagName==='BUTTON') send(e.target.textContent); });
 
 /* ---------- boot ---------- */
-loadSimConfig(); pollSim();
+loadSimConfig(); state.modiBusy = false; applyLocks(); pollSim();
+addEventListener('focus', () => { if (!sim.watchers) pollSim(); });  // re-check when coming back to the tab
 loadLibrary().then(async () => { const first=document.querySelector('#lib button'); if (first) openModel(first.dataset.m); else loadThread(null); });
 }

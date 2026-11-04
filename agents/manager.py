@@ -30,6 +30,7 @@ from langgraph.types import interrupt
 
 from utils import tracing
 from agents.context import build_card, render
+from agents import library
 from agents.design_graph import _category, build_design_graph
 from api import chat_store, store
 from api import services as svc
@@ -73,7 +74,12 @@ again and report the result. Never claim a fix works before it has been checked.
 """
 
 from agents.guardrails import SCOPE_REPLY, SCOPE_RULES, check_output
-SYSTEM_PROMPT = SYSTEM_PROMPT + "\n\n" + SCOPE_RULES
+SYSTEM_PROMPT = SYSTEM_PROMPT + "\n\n" + SCOPE_RULES + """
+
+MODELICA STANDARD LIBRARY: you have search_library, describe_component and list_examples, backed by an index of
+the MSL installed in OpenModelica. When the user asks whether the MSL has something, or about a component's
+parameters, connectors or usage, look it up instead of answering from memory, and name classes exactly as the
+tools return them. Do not claim you checked the library unless you called these tools."""
 _ALLOWED_FENCES = {"", "modelica", "mo", "text", "plaintext"}
 _GENERAL_CODE = re.compile(r"^\s*(def \w+\(|class \w+\(|print\(|from \w+ import|import (numpy|pandas|os|sys|matplotlib)"
                            r"|function \w+\(|const \w+ =|#include|public static)", re.M)
@@ -119,8 +125,8 @@ def _ok(**kw) -> str:
 def build_manager(services: "svc.Services", llm=None, checkpointer=None):
   orc = services.orc
   if llm is None:
-    from langchain_anthropic import ChatAnthropic
-    llm = ChatAnthropic(model=os.getenv("MODEL_NAME", "claude-haiku-5-5"), max_tokens=2048)
+    from agents.llm import make_llm
+    llm = make_llm("modi", max_tokens=2048)
 
   def progress_writer():
     try:
@@ -318,8 +324,37 @@ def build_manager(services: "svc.Services", llm=None, checkpointer=None):
     store.add_note(name, text)
     return _ok(status="noted")
 
+  # ---------------------------------------------------------- MSL knowledge graph (agents/library.py)
+  def _lib_unavailable():
+    return _ok(error="The MSL index is not built yet (it builds automatically in the background after the first "
+                     "start). Answer from general knowledge and say that you could not look it up.")
+
+  @tool
+  def search_library(query: str) -> str:
+    """Search the installed Modelica Standard Library for components, e.g. "tank", "pump speed",
+    "heat capacitor", "gear". Returns class paths with one-line descriptions. Use it before naming an MSL class."""
+    if not library.available():
+      return _lib_unavailable()
+    return _ok(results=library.search(query, limit=8), msl_version=library.meta().get("msl_version"))
+
+  @tool
+  def describe_component(name: str) -> str:
+    """Exact facts about one MSL class from the installed library: parameters (incl. inherited), connectors,
+    replaceable parts that must be redeclared (with valid options), and examples that use it.
+    `name` can be a full path or a unique short name like "OpenTank"."""
+    if not library.available():
+      return _lib_unavailable()
+    return _ok(**library.describe(name))
+
+  @tool
+  def list_examples(components: List[str]) -> str:
+    """MSL example models that use the given components (best templates first), e.g. ["PrescribedPump", "OpenTank"]."""
+    if not library.available():
+      return _lib_unavailable()
+    return _ok(examples=library.examples(components, limit=5))
+
   tools = [read_model, read_results, validate, simulate, plan_simulation, propose_edit,
-           propose_new_model, set_parameters, plot, remember_note]
+           propose_new_model, set_parameters, plot, remember_note, search_library, describe_component, list_examples]
   llm_tools = llm.bind_tools(tools)
 
   def _store_payload(pid, model, kind, payload):

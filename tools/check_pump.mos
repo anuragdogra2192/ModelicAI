@@ -1,0 +1,23 @@
+// Verifies the PrescribedPump pattern from the designer's cheat sheet against the installed MSL.
+// Run inside the Studio container:  docker exec modelicai omc /app/tools/check_pump.mos
+loadModel(Modelica); getErrorString();
+getVersion(Modelica);
+loadString("
+model PumpPatternCheck
+  replaceable package Medium = Modelica.Media.Water.ConstantPropertyLiquidWater;
+  inner Modelica.Fluid.System system;
+  Modelica.Fluid.Sources.Boundary_pT source(redeclare package Medium = Medium, nPorts=1);
+  Modelica.Fluid.Sources.Boundary_pT sink(redeclare package Medium = Medium, p=2e5, nPorts=1);
+  Modelica.Fluid.Machines.PrescribedPump pump(redeclare package Medium = Medium, N_nominal=1500, use_N_in=false,
+    redeclare function flowCharacteristic =
+      Modelica.Fluid.Machines.BaseClasses.PumpCharacteristics.linearFlow(V_flow_nominal={0, 0.01}, head_nominal={20, 0}));
+  Modelica.Units.SI.Area A = 1;
+equation
+  connect(source.ports[1], pump.port_a);
+  connect(pump.port_b, sink.ports[1]);
+  annotation(experiment(StopTime=10));
+end PumpPatternCheck;
+"); getErrorString();
+checkModel(PumpPatternCheck); getErrorString();
+simulate(PumpPatternCheck, stopTime=10); getErrorString();
+val(pump.m_flow, 10.0, "PumpPatternCheck_res.mat");
