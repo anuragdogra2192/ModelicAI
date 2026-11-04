@@ -1,6 +1,6 @@
 import json
 import os
-from langchain_anthropic import ChatAnthropic
+from agents.llm import make_llm
 from langchain_core.messages import HumanMessage, SystemMessage
 
 
@@ -12,9 +12,7 @@ class VisualizationAgent:
   """
 
   def __init__(self):
-    self.llm = ChatAnthropic(
-        model=os.getenv("MODEL_NAME", "claude-haiku-5-5")
-    )
+    self.llm = make_llm("visualization")
 
   def design_dashboard_layout(
       self, available_variables: list, user_intent: str

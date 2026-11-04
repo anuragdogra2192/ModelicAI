@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from langchain_anthropic import ChatAnthropic
+from agents.llm import make_llm
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from utils.tracing import traced
@@ -23,7 +23,7 @@ class SimulationAgent:
   """
 
   def __init__(self):
-    self.llm = ChatAnthropic(model=os.getenv("MODEL_NAME", "claude-haiku-5-5"), max_tokens=1024)
+    self.llm = make_llm("simulation", max_tokens=1024)
 
   # ------------------------------------------------------------------ prompt
   SYSTEM = (
