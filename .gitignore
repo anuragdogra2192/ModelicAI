@@ -44,3 +44,6 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# demo video work (not part of the repo)
+_video/
