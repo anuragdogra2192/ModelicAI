@@ -209,7 +209,8 @@ class Services:
       return {"status": "FAILED", "messages": clean_omc_error(str(e)), "stop_time": stop}
     ok = res["status"] == "SUCCESS"
     return {"status": "SUCCESS" if ok else "FAILED", "stop_time": stop,
-            "messages": "" if ok else clean_omc_error(res.get("messages", ""))[-1200:]}
+            # the runner already summarised the log (key messages first): keep its start, don't filter it
+            "messages": "" if ok else str(res.get("messages", ""))[:1800]}
 
   def validate(self, name: str) -> Dict[str, str]:
     return self.check_file(os.path.abspath(mo_path(name)), name)
@@ -254,7 +255,7 @@ class Services:
     except Exception as e:  # OMC errors while building
       res = {"status": "FAILED", "reason": "build", "wall": 0, "messages": clean_omc_error(str(e))}
     wall = res["wall"]
-    info = {"messages": clean_omc_error(res.get("messages", ""))}
+    info = {"messages": str(res.get("messages", ""))}  # already summarised by the runner
     ok = res["status"] == "SUCCESS"
     metrics = {}
     if ok:
@@ -266,7 +267,7 @@ class Services:
     status = "SUCCESS" if ok else ("STOPPED" if res["status"] == "STOPPED" else "FAILED")
     store.add_run(name, s, ov, status, metrics, wall, source)
     return {"status": status, "reason": res.get("reason"), "settings": s, "overrides": ov, "wall": wall,
-            "messages": str(info.get("messages", ""))[-1500:], "metrics": metrics}
+            "messages": str(info.get("messages", ""))[:1800], "metrics": metrics}
 
   # ------------------------------------------------------------ results
   def variables(self, name: str) -> List[str]:
