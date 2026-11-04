@@ -58,6 +58,36 @@ async def trace_actions(request: Request, call_next):
 
 
 print("=== Starting ModelicAI Studio ===")
+
+
+def _ensure_msl_index():
+  """Build the MSL knowledge graph (data/msl_index.db) in the background on first start. It uses its own OMC
+  process, so Studio stays usable; until it is ready the agents simply work without it."""
+  from agents import library
+  if library.available():
+    m = library.meta()
+    print(f"MSL index: {m.get('classes')} classes, MSL {m.get('msl_version')}, built {m.get('built_at')}")
+    return
+  if os.getenv("MSL_INDEX_AUTOBUILD", "1") != "1":
+    print("MSL index: missing (run: python3 -m tools.build_msl_index)")
+    return
+
+  def run():
+    try:
+      from OMPython import OMCSessionLocal
+      from tools.build_msl_index import build
+      build(OMCSessionLocal(), log=lambda m: print(m, flush=True))
+    except Exception as e:
+      print(f"MSL index build failed: {type(e).__name__}: {e} (run: python3 -m tools.build_msl_index)")
+  import threading
+  print("MSL index: not found, building it in the background (a few minutes)...")
+  threading.Thread(target=run, daemon=True, name="msl-index").start()
+
+
+_ensure_msl_index()
+from agents import llm as _llm
+for _role, _m in _llm.describe().items():
+  print(f"LLM {_role:10s}: {_m['provider']} / {_m['model']}")
 toolbox = SimulationOrchestrator()  # OMC session + designer + simulation agent + graph parser
 
 # Studio REST API and Modi (Manager Agent: LangGraph, tools, human approval, SQLite checkpointer)
