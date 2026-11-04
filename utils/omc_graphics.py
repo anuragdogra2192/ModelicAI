@@ -428,6 +428,21 @@ class DiagramBuilder:
     return self._icons[cls]
 
   # -- model level -------------------------------------------------------
+  def modifiers(self, model: str, comp: str, source: str = "") -> Dict[str, str]:
+    """Modifier values of one component (e.g. {'R': 'R', 'V': '5'}): OMC's API (older getComponent* or newer
+    getElement* names), then the declaration in the source as a fallback (the API calls can fail silently)."""
+    out: Dict[str, str] = {}
+    for names_fn, value_fn in (("getComponentModifierNames", "getComponentModifierValue"),
+                               ("getElementModifierNames", "getElementModifierValue")):
+      names = self.q(f"{names_fn}({model}, {comp})")
+      for mname in (names if isinstance(names, (list, tuple)) else []):
+        val = self.raw(f"{value_fn}({model}, {comp}.{mname})").strip().strip('"')
+        if val and not val.startswith("Error"):
+          out[str(mname)] = val.lstrip("= ").strip()
+      if out:
+        return out
+    return _source_modifiers(source, comp)
+
   def scene(self, model: str, source: str = "") -> Dict[str, Any]:
     imports = parse_imports(source)
     comps, missing, out_dirs = [], 0, {}
@@ -450,12 +465,7 @@ class DiagramBuilder:
         dx, dy = px - center[0], py - center[1]
         out_dirs[f'{comp["name"]}.{pname}'] = (
             (1 if dx > 0 else -1, 0) if abs(dx) >= abs(dy) else (0, 1 if dy > 0 else -1))
-      modifiers, defaults = {}, {}
-      mnames = self.q(f"getComponentModifierNames({model}, {comp['name']})")
-      for mname in (mnames if isinstance(mnames, list) else []):
-        val = self.raw(f"getComponentModifierValue({model}, {comp['name']}.{mname})").strip().strip('"')
-        if val and not val.startswith("Error"):
-          modifiers[str(mname)] = val.lstrip("= ").strip()
+      modifiers, defaults = self.modifiers(model, comp["name"], source), {}
       for key in set(re.findall(r"%([A-Za-z_]\w*)", svg)) - {"name", "class"} - set(modifiers):
         val = self.raw(f'getParameterValue({t}, "{key}")').strip().strip('"')
         if val:
@@ -519,6 +529,39 @@ def route(pa, da, pb, db, stub=6.0):
       out[-1] = p
       continue
     out.append(p)
+  return out
+
+
+def _source_modifiers(source: str, comp: str) -> Dict[str, str]:
+  """key -> value from `Type comp(key=value, ...)` in the model source (top level only, no redeclares)."""
+  m = re.search(rf"^[ \t]*(?:(?:inner|outer|parameter|final|replaceable)\s+)*[A-Za-z_][\w.]*\s+{re.escape(comp)}\s*(?:\[[^\]]*\])?\s*\(",
+                source or "", re.M)
+  if not m:
+    return {}
+  i, depth, start, items = m.end(), 1, m.end(), []
+  while i < len(source) and depth:
+    c = source[i]
+    if c == '"':
+      j = source.find('"', i + 1)
+      i = j if j > 0 else len(source)
+    elif c in "({[":
+      depth += 1
+    elif c in ")}]":
+      depth -= 1
+      if depth == 0:
+        items.append(source[start:i])
+    elif c == "," and depth == 1:
+      items.append(source[start:i])
+      start = i + 1
+    i += 1
+  out = {}
+  for it in items:
+    it = re.sub(r"^\s*(?:each|final)\s+", "", it.strip())
+    if it.startswith("redeclare"):
+      continue
+    kv = re.match(r"([A-Za-z_]\w*)\s*(?:\([^=]*\))?\s*=\s*(.+)$", it, re.S)
+    if kv:
+      out[kv.group(1)] = re.sub(r"\s+", " ", kv.group(2)).strip()
   return out
 
 
